@@ -418,13 +418,30 @@ INFORMACIÓN REAL DE LOS PRODUCTOS:
 Devolvé SOLO el texto al cliente. Sin JSON, sin markdown."""
 
 
-def prompt_pedido(cfg: dict) -> str:
-    # Placeholder de la Capa 3. Por ahora deriva a asesor con un mensaje suave.
+def prompt_pedido(cfg: dict, lista_txt: str, carrito_txt: str) -> str:
     return f"""{_ctx_tenant(cfg)}
 
-El contacto quiere hacer un pedido. En esta etapa todavía no está habilitada la toma de pedidos automática. Pedile amablemente que te diga qué productos le interesan así lo vas asesorando, y avisá que en breve vas a poder cerrar el pedido. NO inventes precios.
+Tu rol ahora: TOMAR EL PEDIDO. Se vende SOLO por bulto entero. Atendé con naturalidad e incitá sutilmente a sumar productos (en vez de "¿con eso estaría?", preguntá "¿qué más te llevás?").
 
-Devolvé SOLO el texto al contacto. Sin JSON, sin markdown."""
+CÓMO TRABAJÁS:
+- Identificá qué productos quiere agregar el cliente, usando los nombres EXACTOS del catálogo de abajo. Si el cliente es ambiguo (ej. dice "27" que es un formato, no cantidad; o no aclara fragancia), preguntá para clarificar antes de agregar.
+- Cuando el cliente quiera cerrar ("listo", "nada más", "cerralo"), pedí confirmación mostrando que vas a cerrar el pedido.
+- Cuando el cliente CONFIRMA (dice "sí", "dale", "confirmo", "ok cerralo"), marcá accion: "confirmar".
+
+CATÁLOGO (nombres exactos, se vende por bulto):
+{lista_txt}
+
+CARRITO ACTUAL:
+{carrito_txt}
+
+Respondé SIEMPRE con texto al cliente + este JSON al final (el cliente NO ve el JSON):
+---JSON---
+{{"accion": "agregar|nada|confirmar", "items": [{{"producto": "Nombre exacto del catálogo", "cantidad": 1}}]}}
+---FIN---
+- accion "agregar": cuando sumás productos al carrito (completá items con nombre exacto y cantidad en bultos).
+- accion "nada": cuando solo charlás, aclarás dudas o preguntás (items vacío).
+- accion "confirmar": SOLO cuando el cliente confirmó que cierra el pedido (items vacío).
+- Nunca inventes productos ni precios. La cantidad es en bultos."""
 
 
 def prompt_agente_humano(cfg: dict) -> str:
@@ -439,8 +456,136 @@ RESPUESTA JSON OBLIGATORIA (el usuario NO la ve):
 
 
 # ─────────────────────────────────────────────
-# CEREBRO
+# PEDIDOS (Capa 3)
 # ─────────────────────────────────────────────
+
+# Contacto genérico para pruebas (hasta tener la tabla contacts real)
+CONTACTO_PRUEBA = "4799b595-5388-4002-8ba8-b9a82624a802"
+
+
+async def buscar_producto_para_pedido(tenant_id: str, nombres: list) -> list:
+    """Trae producto + variante default (precio, stock, reserved, ids) para los nombres dados."""
+    if not nombres:
+        return []
+    valores = ",".join('"' + n.replace('"', '') + '"' for n in nombres)
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.get(
+            f"{SUPABASE_URL}/rest/v1/products",
+            headers=_headers(),
+            params={"tenant_id": f"eq.{tenant_id}", "active": "eq.true",
+                    "name": f"in.({valores})",
+                    "select": "id,name,product_variants(id,name,price,stock,reserved,is_default,active)"}
+        )
+        data = r.json()
+    out = []
+    if isinstance(data, list):
+        for p in data:
+            variantes = [v for v in (p.get("product_variants") or []) if v.get("active", True)]
+            # variante default o la primera
+            v = next((x for x in variantes if x.get("is_default")), variantes[0] if variantes else None)
+            if not v:
+                continue
+            stock = v.get("stock") or 0
+            reserved = v.get("reserved") or 0
+            out.append({
+                "product_id": p["id"],
+                "product_name": p["name"],
+                "variant_id": v["id"],
+                "precio": float(v.get("price") or 0),
+                "disponible": max(0, stock - reserved),
+            })
+    return out
+
+
+def formato_tabla_pedido(items: list) -> str:
+    """Resumen del pedido en tabla monospace numerada con total."""
+    if not items:
+        return "(pedido vacío)"
+    lineas = ["```", "N°  Producto                          Cant   Precio", "──────────────────────────────────────────────────"]
+    total = 0
+    for i, it in enumerate(items, 1):
+        nombre = it["product_name"][:30].ljust(30)
+        cant = str(it["cantidad"]).center(5)
+        subtotal = it["precio"] * it["cantidad"]
+        total += subtotal
+        lineas.append(f"{str(i).ljust(3)} {nombre} {cant} ${subtotal:,.0f}")
+    lineas.append("──────────────────────────────────────────────────")
+    lineas.append(f"TOTAL{' ' * 38}${total:,.0f}")
+    lineas.append("```")
+    return "\n".join(lineas)
+
+
+def total_pedido(items: list) -> float:
+    return sum(it["precio"] * it["cantidad"] for it in items)
+
+
+async def registrar_pedido(tenant_id: str, contact_uuid: str, items: list, direccion: str = "") -> dict:
+    """Crea orders + order_items y reserva stock. Devuelve {ok, order_id} o {ok: False, error}."""
+    from datetime import timedelta
+    total = total_pedido(items)
+    delivery = (datetime.utcnow() + timedelta(days=1)).date().isoformat()
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            # 1) Crear la orden
+            r = await client.post(
+                f"{SUPABASE_URL}/rest/v1/orders",
+                headers=_headers({"Content-Type": "application/json", "Prefer": "return=representation"}),
+                json={
+                    "tenant_id": tenant_id,
+                    "contact_id": contact_uuid,
+                    "status": "pendiente",
+                    "total": total,
+                    "source": "whatsapp",
+                    "delivery_date": delivery,
+                    "delivery_address": direccion or None,
+                }
+            )
+            orden = r.json()
+            if not (isinstance(orden, list) and len(orden) > 0 and orden[0].get("id")):
+                print(f"[registrar_pedido] fallo al crear orden: status={r.status_code} resp={orden}")
+                return {"ok": False, "error": "No se pudo crear la orden"}
+            order_id = orden[0]["id"]
+
+            # 2) Crear los items
+            items_payload = [{
+                "tenant_id": tenant_id,
+                "order_id": order_id,
+                "product_id": it["product_id"],
+                "variant_id": it["variant_id"],
+                "quantity": it["cantidad"],
+                "unit_price": it["precio"],
+                "line_total": it["precio"] * it["cantidad"],
+            } for it in items]
+            r2 = await client.post(
+                f"{SUPABASE_URL}/rest/v1/order_items",
+                headers=_headers({"Content-Type": "application/json", "Prefer": "return=minimal"}),
+                json=items_payload
+            )
+            if r2.status_code >= 300:
+                print(f"[registrar_pedido] fallo al crear items: status={r2.status_code} resp={r2.text[:200]}")
+
+            # 3) Reservar stock (sumar a reserved de cada variante)
+            for it in items:
+                rv = await client.get(
+                    f"{SUPABASE_URL}/rest/v1/product_variants",
+                    headers=_headers(),
+                    params={"id": f"eq.{it['variant_id']}", "select": "reserved"}
+                )
+                actual = rv.json()
+                reserved_actual = (actual[0].get("reserved") or 0) if isinstance(actual, list) and actual else 0
+                await client.patch(
+                    f"{SUPABASE_URL}/rest/v1/product_variants",
+                    headers=_headers({"Content-Type": "application/json", "Prefer": "return=minimal"}),
+                    params={"id": f"eq.{it['variant_id']}"},
+                    json={"reserved": reserved_actual + it["cantidad"]}
+                )
+        return {"ok": True, "order_id": order_id, "total": total, "delivery": delivery}
+    except Exception as e:
+        print(f"[registrar_pedido] excepción: {e}")
+        return {"ok": False, "error": str(e)}
+
+
+
 
 RUTAS_VALIDAS = ("ASESOR", "PEDIDO", "CONTINUAR", "CHARLA", "AGENTE_HUMANO")
 AGENTES_CONTENIDO = ("asesor", "pedido", "agente_humano")
@@ -482,6 +627,10 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
     else:
         agente = "charla"
 
+    # Carrito actual (lo necesita el agente pedido)
+    carrito = conv["pedido"] if isinstance(conv["pedido"], list) else []
+    pedido_registrado = None
+
     historial.append({"role": "user", "content": mensaje})
 
     if agente == "charla":
@@ -502,22 +651,78 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
             historial, max_tokens=700
         )
     elif agente == "pedido":
-        raw = await llamar_claude(prompt_pedido(cfg), historial, max_tokens=500)
+        lista = await get_lista_liviana(tenant_id)
+        carrito_txt = formato_tabla_pedido(carrito) if carrito else "(vacío)"
+        raw = await llamar_claude(
+            prompt_pedido(cfg, formato_lista_liviana(lista), carrito_txt),
+            historial, max_tokens=600
+        )
+        texto_tmp, jd_ped = parsear_respuesta(raw)
+        accion = (jd_ped.get("accion") or "nada").lower()
+
+        if accion == "agregar":
+            nombres = [it.get("producto", "") for it in (jd_ped.get("items") or [])]
+            cants = {it.get("producto", ""): int(it.get("cantidad", 1) or 1) for it in (jd_ped.get("items") or [])}
+            encontrados = await buscar_producto_para_pedido(tenant_id, nombres)
+            avisos = []
+            for prod in encontrados:
+                pedido_cant = cants.get(prod["product_name"], 1)
+                if prod["disponible"] <= 0:
+                    avisos.append(f"⚠️ {prod['product_name']}: sin stock, no lo pude agregar.")
+                    continue
+                if pedido_cant > prod["disponible"]:
+                    avisos.append(f"⚠️ {prod['product_name']}: solo hay {prod['disponible']} disponibles, agregué esa cantidad.")
+                    pedido_cant = prod["disponible"]
+                carrito.append({
+                    "product_id": prod["product_id"],
+                    "product_name": prod["product_name"],
+                    "variant_id": prod["variant_id"],
+                    "precio": prod["precio"],
+                    "cantidad": pedido_cant,
+                })
+            # Texto: respuesta del modelo + tabla actualizada + avisos
+            texto = texto_tmp
+            if avisos:
+                texto += "\n\n" + "\n".join(avisos)
+            texto += "\n\n" + formato_tabla_pedido(carrito)
+
+        elif accion == "confirmar":
+            if not carrito:
+                texto = "No tengo productos en el pedido todavía. ¿Qué te gustaría llevar?"
+            else:
+                res = await registrar_pedido(tenant_id, CONTACTO_PRUEBA, carrito, conv.get("direccion", ""))
+                if res["ok"]:
+                    pedido_registrado = res
+                    texto = (f"{texto_tmp}\n\n✅ ¡Pedido registrado! Total: ${res['total']:,.0f}. "
+                             f"Entrega prevista: {res['delivery']}. Te esperamos.")
+                    carrito = []  # vaciar carrito tras registrar
+                else:
+                    texto = "Tuve un problema al registrar el pedido. ¿Probamos de nuevo en un momento?"
+        else:
+            texto = texto_tmp
     else:  # agente_humano
         raw = await llamar_claude(prompt_agente_humano(cfg), historial, max_tokens=200)
 
     if not raw:
         return None, None, {}
 
-    texto, json_data = parsear_respuesta(raw)
+    if agente != "pedido":
+        texto, json_data = parsear_respuesta(raw)
+    else:
+        json_data = {}
+
     historial.append({"role": "assistant", "content": texto})
 
-    # Persistir
+    # Persistir (incluye carrito actualizado)
     nueva_tarea = agente if agente in AGENTES_CONTENIDO else ""
+    # si se registró el pedido, ya no hay tarea de pedido pendiente
+    if pedido_registrado:
+        nueva_tarea = ""
     await upsert_conversacion(tenant_id, contact_id, {
         "historial": historial,
         "agente_activo": agente,
         "tarea_pendiente": nueva_tarea,
+        "pedido_en_curso": carrito,
     })
     await guardar_log(tenant_id, contact_id, agente, mensaje, texto)
 
@@ -540,7 +745,7 @@ def _respuesta_unificada(agente, texto, json_data):
 
 @app.get("/")
 async def health():
-    return {"status": "CPM activo — motor multi-tenant + catálogo (Capa 1+2)"}
+    return {"status": "CPM activo — multi-tenant + catálogo + pedidos (Capa 1+2+3)"}
 
 
 @app.post("/orquestador")
