@@ -638,12 +638,23 @@ async def registrar_pedido(tenant_id: str, contact_uuid: str, items: list, direc
 # AUDIO (Capa 4 — Whisper)
 # ─────────────────────────────────────────────
 
-def es_url_audio(texto: str) -> bool:
-    """Detecta si el mensaje es una URL (audio de WhatsApp vía ManyChat en Last Text Input)."""
+def tipo_de_url(texto: str) -> str:
+    """Devuelve 'audio', 'imagen' o 'texto' según el contenido del mensaje."""
     if not texto:
-        return False
-    t = texto.strip()
-    return t.lower().startswith("http") and " " not in t
+        return "texto"
+    t = texto.strip().lower()
+    if not t.startswith("http") or " " in t:
+        return "texto"
+    audio_ext = (".ogg", ".oga", ".opus", ".mp3", ".m4a", ".wav", ".webm", ".mp4", ".mpeg", ".mpga")
+    img_ext = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp")
+    # cortar querystring si la hay
+    base = t.split("?")[0]
+    if base.endswith(audio_ext):
+        return "audio"
+    if base.endswith(img_ext):
+        return "imagen"
+    # si es URL pero no reconocemos extensión, asumimos imagen (las de ManyChat a veces no traen ext clara)
+    return "imagen"
 
 
 async def transcribir_audio(audio_url: str) -> str:
@@ -672,6 +683,72 @@ async def transcribir_audio(audio_url: str) -> str:
     except Exception as e:
         print(f"[transcribir_audio] excepción: {e}")
         return None
+
+
+async def leer_imagen(imagen_url: str, lista_catalogo: str) -> dict:
+    """Claude lee la imagen (factura/nota/lista) y extrae productos+cantidades cruzando con el catálogo.
+    Devuelve {tipo: 'pedido'|'descripcion', items: [...], texto: '...'}."""
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            ir = await client.get(imagen_url)
+            if ir.status_code != 200:
+                print(f"[leer_imagen] descarga falló status={ir.status_code}")
+                return {"tipo": "error", "items": [], "texto": ""}
+            import base64
+            img_b64 = base64.standard_b64encode(ir.content).decode("utf-8")
+            media_type = ir.headers.get("content-type", "image/jpeg")
+            if "jpeg" in media_type or "jpg" in media_type:
+                media_type = "image/jpeg"
+            elif "png" in media_type:
+                media_type = "image/png"
+            elif "webp" in media_type:
+                media_type = "image/webp"
+            else:
+                media_type = "image/jpeg"
+
+            prompt_vision = f"""Sos un asistente que lee imágenes para tomar pedidos de una distribuidora. El cliente mandó una foto que puede ser: una factura/remito anterior, una nota escrita a mano, o una lista de productos.
+
+Tu tarea: identificá qué PRODUCTOS y CANTIDADES aparecen en la imagen, y cruzalos con este catálogo (usá los nombres EXACTOS del catálogo):
+
+CATÁLOGO:
+{lista_catalogo}
+
+Respondé SOLO con este JSON:
+{{"tipo": "pedido" o "descripcion", "items": [{{"producto": "nombre exacto del catálogo", "cantidad": N}}], "texto": "qué ves en la imagen, breve"}}
+
+- Si identificás productos que matchean el catálogo → tipo "pedido", completá items con nombres exactos y cantidades.
+- Si la imagen no tiene productos claros, está borrosa o no se entiende → tipo "descripcion", items vacío, y en "texto" describí brevemente qué ves.
+- Nunca inventes productos que no estén en el catálogo."""
+
+            r = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "Content-Type": "application/json"},
+                json={
+                    "model": MODELO,
+                    "max_tokens": 800,
+                    "messages": [{
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": img_b64}},
+                            {"type": "text", "text": prompt_vision}
+                        ]
+                    }]
+                }
+            )
+        data = r.json()
+        if "content" not in data:
+            print(f"[leer_imagen] sin content | status={r.status_code} resp={data}")
+            return {"tipo": "error", "items": [], "texto": ""}
+        raw = data["content"][0]["text"]
+        jd = _extraer_json(raw)
+        return {
+            "tipo": jd.get("tipo", "descripcion"),
+            "items": jd.get("items", []),
+            "texto": jd.get("texto", ""),
+        }
+    except Exception as e:
+        print(f"[leer_imagen] excepción: {e}")
+        return {"tipo": "error", "items": [], "texto": ""}
 
 
 RUTAS_VALIDAS = ("ASESOR", "PEDIDO", "CONTINUAR", "CHARLA", "AGENTE_HUMANO")
@@ -839,7 +916,7 @@ def _respuesta_unificada(agente, texto, json_data):
 
 @app.get("/")
 async def health():
-    return {"status": "CPM activo — multi-tenant + catálogo + pedidos + audio (Capa 1-4)"}
+    return {"status": "CPM activo — multi-tenant + catálogo + pedidos + imágenes (Capa 1-5)"}
 
 
 @app.post("/orquestador")
@@ -858,12 +935,28 @@ async def orquestador(request: Request):
     if not tenant:
         return JSONResponse(_respuesta_unificada("charla", "No encontré la configuración de este negocio. Avisá al administrador.", {}))
 
-    # Si el mensaje es una URL (audio de WhatsApp vía ManyChat), transcribir con Whisper
-    if es_url_audio(mensaje):
+    tipo_msg = tipo_de_url(mensaje)
+
+    # AUDIO: por ahora no se puede capturar desde ManyChat → mensaje prolijo
+    if tipo_msg == "audio":
         transcripto = await transcribir_audio(mensaje)
         if not transcripto:
-            return JSONResponse(_respuesta_unificada("charla", "No pude escuchar bien el audio 🙉 ¿Me lo escribís o lo mandás de nuevo?", {}))
+            return JSONResponse(_respuesta_unificada("charla", "Por ahora no puedo escuchar audios 🙉 ¿me lo escribís?", {}))
         mensaje = transcripto
+
+    # IMAGEN: leer con visión, extraer productos y cruzar con catálogo
+    elif tipo_msg == "imagen":
+        lista = await get_lista_liviana(tenant["tenant_id"])
+        resultado = await leer_imagen(mensaje, formato_lista_liviana(lista))
+        if resultado["tipo"] == "pedido" and resultado["items"]:
+            # convertir lo que vio en un "mensaje" de pedido para el flujo normal
+            partes = [f"{it.get('cantidad', 1)} x {it.get('producto', '')}" for it in resultado["items"]]
+            mensaje = "Quiero pedir lo de esta imagen: " + ", ".join(partes)
+        elif resultado["tipo"] == "descripcion":
+            return JSONResponse(_respuesta_unificada("charla",
+                f"Vi tu imagen: {resultado['texto']}. ¿Querés que te arme un pedido con algo de esto? Contame qué necesitás.", {}))
+        else:
+            return JSONResponse(_respuesta_unificada("charla", "No pude abrir bien la imagen. ¿Me la mandás de nuevo o me escribís qué necesitás?", {}))
 
     agente, texto, json_data = await manejar_turno(tenant, contact_id, mensaje)
     if texto is None:
