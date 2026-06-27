@@ -249,7 +249,7 @@ def es_consulta_amplia(mensaje: str) -> bool:
     return any(s in m for s in señales)
 
 
-
+async def get_detalle_productos(tenant_id: str, nombres: list) -> list:
     """Dado nombres exactos de productos, trae su detalle completo con variantes."""
     if not nombres:
         return []
