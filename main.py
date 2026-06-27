@@ -20,6 +20,7 @@ SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 ANTHROPIC_KEY = os.environ["ANTHROPIC_KEY"]
 MANYCHAT_API_KEY = os.environ.get("MANYCHAT_API_KEY", "")
+OPENAI_KEY = os.environ.get("OPENAI_KEY", "")
 MODELO = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 
 TABLA_CONV = "conversaciones_cpm"
@@ -212,7 +213,43 @@ def formato_lista_liviana(lista: list) -> str:
     return "\n".join(lineas)
 
 
-async def get_detalle_productos(tenant_id: str, nombres: list) -> list:
+async def get_categorias_con_destacados(tenant_id: str, por_categoria: int = 3) -> str:
+    """Para consultas amplias: lista categorías con algunos productos destacados de cada una."""
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.get(
+            f"{SUPABASE_URL}/rest/v1/products",
+            headers=_headers(),
+            params={"tenant_id": f"eq.{tenant_id}", "active": "eq.true",
+                    "select": "name,product_categories(name)"}
+        )
+        data = r.json()
+    if not isinstance(data, list) or not data:
+        return "(catálogo vacío)"
+    # Agrupar por categoría
+    cats = {}
+    for p in data:
+        pc = p.get("product_categories")
+        cat = pc.get("name", "Otros") if isinstance(pc, dict) else "Otros"
+        cats.setdefault(cat, []).append(p.get("name", ""))
+    bloques = []
+    for cat, prods in cats.items():
+        destacados = prods[:por_categoria]
+        lista = "\n".join(f"  • {n}" for n in destacados)
+        extra = f"\n  ...y {len(prods) - por_categoria} más" if len(prods) > por_categoria else ""
+        bloques.append(f"CATEGORÍA: {cat} ({len(prods)} productos)\n{lista}{extra}")
+    return "\n\n".join(bloques)
+
+
+def es_consulta_amplia(mensaje: str) -> bool:
+    """Detecta si el cliente pregunta por el catálogo en general, no un producto puntual."""
+    m = mensaje.lower()
+    señales = ["que tenes", "qué tenés", "que hay", "qué hay", "catalogo", "catálogo",
+               "que venden", "qué venden", "que productos", "qué productos", "todo lo que",
+               "que mas hay", "qué más hay", "opciones", "lista de", "mostrame todo", "que ofrecen"]
+    return any(s in m for s in señales)
+
+
+
     """Dado nombres exactos de productos, trae su detalle completo con variantes."""
     if not nombres:
         return []
@@ -381,6 +418,18 @@ def prompt_charla(cfg: dict) -> str:
 El contacto te saludó o hace charla casual. Respondé cálido y breve. Si pregunta en qué podés ayudar, explicá que podés asesorarlo sobre los productos y tomar su pedido. NO inventes productos ni precios.{extra}
 
 Devolvé SOLO el texto al contacto. Sin JSON, sin markdown."""
+
+
+def prompt_asesor_catalogo(cfg: dict, cats_txt: str) -> str:
+    """Para consultas amplias: presenta categorías + destacados e invita a elegir."""
+    return f"""{_ctx_tenant(cfg)}
+
+El cliente pregunta qué hay en el catálogo (consulta amplia, no un producto puntual). Presentale las CATEGORÍAS disponibles con algunos productos destacados de cada una, de forma breve y ordenada, e invitalo a que te diga qué categoría o producto le interesa para darle más detalle. No tires los precios todavía (solo si pregunta). No inventes nada fuera de la lista.
+
+CATÁLOGO POR CATEGORÍAS:
+{cats_txt}
+
+Devolvé SOLO el texto al cliente. Sin JSON, sin markdown."""
 
 
 def prompt_asesor_paso1(cfg: dict, lista_txt: str) -> str:
@@ -585,6 +634,44 @@ async def registrar_pedido(tenant_id: str, contact_uuid: str, items: list, direc
         return {"ok": False, "error": str(e)}
 
 
+# ─────────────────────────────────────────────
+# AUDIO (Capa 4 — Whisper)
+# ─────────────────────────────────────────────
+
+def es_url_audio(texto: str) -> bool:
+    """Detecta si el mensaje es una URL (audio de WhatsApp vía ManyChat en Last Text Input)."""
+    if not texto:
+        return False
+    t = texto.strip()
+    return t.lower().startswith("http") and " " not in t
+
+
+async def transcribir_audio(audio_url: str) -> str:
+    """Descarga el audio y lo transcribe con Whisper (OpenAI). Devuelve texto o None."""
+    if not OPENAI_KEY:
+        print("[transcribir_audio] falta OPENAI_KEY")
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            ar = await client.get(audio_url)
+            if ar.status_code != 200:
+                print(f"[transcribir_audio] descarga falló status={ar.status_code}")
+                return None
+            audio_bytes = ar.content
+            r = await client.post(
+                "https://api.openai.com/v1/audio/transcriptions",
+                headers={"Authorization": f"Bearer {OPENAI_KEY}"},
+                files={"file": ("audio.ogg", audio_bytes, "audio/ogg")},
+                data={"model": "whisper-1", "language": "es"}
+            )
+        data = r.json()
+        if "text" not in data:
+            print(f"[transcribir_audio] sin text | status={r.status_code} resp={data}")
+            return None
+        return data["text"].strip()
+    except Exception as e:
+        print(f"[transcribir_audio] excepción: {e}")
+        return None
 
 
 RUTAS_VALIDAS = ("ASESOR", "PEDIDO", "CONTINUAR", "CHARLA", "AGENTE_HUMANO")
@@ -636,20 +723,27 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
     if agente == "charla":
         raw = await llamar_claude(prompt_charla(cfg), historial, max_tokens=300)
     elif agente == "asesor":
-        # Paso 1: identificar qué productos pide el cliente (lista liviana)
-        lista = await get_lista_liviana(tenant_id)
-        raw1 = await llamar_claude(
-            prompt_asesor_paso1(cfg, formato_lista_liviana(lista)),
-            historial, max_tokens=200
-        )
-        _, jd1 = parsear_respuesta(raw1)
-        nombres = jd1.get("productos") or []
-        # Paso 2: traer detalle real y responder
-        detalle = await get_detalle_productos(tenant_id, nombres) if nombres else []
-        raw = await llamar_claude(
-            prompt_asesor_paso2(cfg, formato_detalle(detalle)),
-            historial, max_tokens=700
-        )
+        if es_consulta_amplia(mensaje):
+            # Consulta amplia: mostrar categorías + destacados
+            cats_txt = await get_categorias_con_destacados(tenant_id)
+            raw = await llamar_claude(
+                prompt_asesor_catalogo(cfg, cats_txt),
+                historial, max_tokens=600
+            )
+        else:
+            # Producto puntual: flujo de dos pasos
+            lista = await get_lista_liviana(tenant_id)
+            raw1 = await llamar_claude(
+                prompt_asesor_paso1(cfg, formato_lista_liviana(lista)),
+                historial, max_tokens=200
+            )
+            _, jd1 = parsear_respuesta(raw1)
+            nombres = jd1.get("productos") or []
+            detalle = await get_detalle_productos(tenant_id, nombres) if nombres else []
+            raw = await llamar_claude(
+                prompt_asesor_paso2(cfg, formato_detalle(detalle)),
+                historial, max_tokens=700
+            )
     elif agente == "pedido":
         lista = await get_lista_liviana(tenant_id)
         carrito_txt = formato_tabla_pedido(carrito) if carrito else "(vacío)"
@@ -745,7 +839,7 @@ def _respuesta_unificada(agente, texto, json_data):
 
 @app.get("/")
 async def health():
-    return {"status": "CPM activo — multi-tenant + catálogo + pedidos (Capa 1+2+3)"}
+    return {"status": "CPM activo — multi-tenant + catálogo + pedidos + audio (Capa 1-4)"}
 
 
 @app.post("/orquestador")
@@ -763,6 +857,13 @@ async def orquestador(request: Request):
     tenant = await resolver_tenant(page_id)
     if not tenant:
         return JSONResponse(_respuesta_unificada("charla", "No encontré la configuración de este negocio. Avisá al administrador.", {}))
+
+    # Si el mensaje es una URL (audio de WhatsApp vía ManyChat), transcribir con Whisper
+    if es_url_audio(mensaje):
+        transcripto = await transcribir_audio(mensaje)
+        if not transcripto:
+            return JSONResponse(_respuesta_unificada("charla", "No pude escuchar bien el audio 🙉 ¿Me lo escribís o lo mandás de nuevo?", {}))
+        mensaje = transcripto
 
     agente, texto, json_data = await manejar_turno(tenant, contact_id, mensaje)
     if texto is None:
