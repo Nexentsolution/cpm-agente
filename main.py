@@ -470,27 +470,34 @@ Devolvé SOLO el texto al cliente. Sin JSON, sin markdown."""
 def prompt_pedido(cfg: dict, lista_txt: str, carrito_txt: str) -> str:
     return f"""{_ctx_tenant(cfg)}
 
-Tu rol ahora: TOMAR EL PEDIDO. Se vende SOLO por bulto entero. Atendé con naturalidad e incitá sutilmente a sumar productos (en vez de "¿con eso estaría?", preguntá "¿qué más te llevás?").
+Tu rol ahora: TOMAR EL PEDIDO. Se vende por bulto entero. Atendé con naturalidad e incitá sutilmente a sumar productos (en vez de "¿con eso estaría?", preguntá "¿qué más te llevás?").
 
 CÓMO TRABAJÁS:
-- Identificá qué productos quiere agregar el cliente, usando los nombres EXACTOS del catálogo de abajo. Si el cliente es ambiguo (ej. dice "27" que es un formato, no cantidad; o no aclara fragancia), preguntá para clarificar antes de agregar.
-- Cuando el cliente quiera cerrar ("listo", "nada más", "cerralo"), pedí confirmación mostrando que vas a cerrar el pedido.
-- Cuando el cliente CONFIRMA (dice "sí", "dale", "confirmo", "ok cerralo"), marcá accion: "confirmar".
+- Identificá qué productos quiere agregar el cliente, usando los nombres EXACTOS del catálogo de abajo.
+- Si el cliente es ambiguo (ej. dice "27" que es un formato/ml, no una cantidad; o no aclara fragancia/variante), PREGUNTÁ para aclarar ANTES de agregar. Nunca asumas cantidades: si no dice cuántos, asumí 1 bulto pero aclaralo.
+- NO agregues un producto que ya está en el carrito de nuevo. Si el cliente corrige la cantidad ("quería 1, no 2"), usá accion "reemplazar" para fijar la cantidad correcta, no "agregar".
+- PRECIOS: si el cliente pregunta el precio o el total, DECÍSELO. Los precios están en el carrito de abajo. Nunca digas que "no tenés los precios" — sí los tenés. Informá el total cuando lo pidan.
 
-CATÁLOGO (nombres exactos, se vende por bulto):
+CONFIRMACIÓN (importante):
+- Cuando el cliente quiera cerrar, mostrá el resumen con el total y pedí confirmación EXPLÍCITA: "¿Confirmás el pedido?".
+- Marcá accion "confirmar" SOLO si el cliente confirma de forma clara: "confirmo", "sí, cerrá", "dale cerralo", "está bien cerrá". 
+- Si el cliente dice algo ambiguo como "si" mientras pregunta otra cosa (ej. "si, cuánto es?"), NO es una confirmación: respondé su pregunta y volvé a pedir confirmación explícita. Ante la duda, NO confirmes.
+
+CATÁLOGO (nombres exactos):
 {lista_txt}
 
-CARRITO ACTUAL:
+CARRITO ACTUAL (con precios):
 {carrito_txt}
 
 Respondé SIEMPRE con texto al cliente + este JSON al final (el cliente NO ve el JSON):
 ---JSON---
-{{"accion": "agregar|nada|confirmar", "items": [{{"producto": "Nombre exacto del catálogo", "cantidad": 1}}]}}
+{{"accion": "agregar|reemplazar|nada|confirmar", "items": [{{"producto": "Nombre exacto del catálogo", "cantidad": 1}}]}}
 ---FIN---
-- accion "agregar": cuando sumás productos al carrito (completá items con nombre exacto y cantidad en bultos).
-- accion "nada": cuando solo charlás, aclarás dudas o preguntás (items vacío).
-- accion "confirmar": SOLO cuando el cliente confirmó que cierra el pedido (items vacío).
-- Nunca inventes productos ni precios. La cantidad es en bultos."""
+- accion "agregar": sumar productos NUEVOS al carrito (los que no estaban).
+- accion "reemplazar": corregir la cantidad de un producto que YA está en el carrito (poné la cantidad final correcta).
+- accion "nada": cuando solo charlás, aclarás dudas, informás precios o preguntás (items vacío).
+- accion "confirmar": SOLO ante confirmación explícita y clara del cliente (items vacío).
+- La cantidad es en bultos."""
 
 
 def prompt_agente_humano(cfg: dict) -> str:
@@ -831,9 +838,10 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
         texto_tmp, jd_ped = parsear_respuesta(raw)
         accion = (jd_ped.get("accion") or "nada").lower()
 
-        if accion == "agregar":
-            nombres = [it.get("producto", "") for it in (jd_ped.get("items") or [])]
-            cants = {it.get("producto", ""): int(it.get("cantidad", 1) or 1) for it in (jd_ped.get("items") or [])}
+        if accion in ("agregar", "reemplazar"):
+            items_ped = jd_ped.get("items") or []
+            nombres = [it.get("producto", "") for it in items_ped]
+            cants = {it.get("producto", ""): int(it.get("cantidad", 1) or 1) for it in items_ped}
             encontrados = await buscar_producto_para_pedido(tenant_id, nombres)
             avisos = []
             for prod in encontrados:
@@ -842,16 +850,23 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
                     avisos.append(f"⚠️ {prod['product_name']}: sin stock, no lo pude agregar.")
                     continue
                 if pedido_cant > prod["disponible"]:
-                    avisos.append(f"⚠️ {prod['product_name']}: solo hay {prod['disponible']} disponibles, agregué esa cantidad.")
+                    avisos.append(f"⚠️ {prod['product_name']}: solo hay {prod['disponible']} disponibles, ajusté la cantidad.")
                     pedido_cant = prod["disponible"]
-                carrito.append({
-                    "product_id": prod["product_id"],
-                    "product_name": prod["product_name"],
-                    "variant_id": prod["variant_id"],
-                    "precio": prod["precio"],
-                    "cantidad": pedido_cant,
-                })
-            # Texto: respuesta del modelo + tabla actualizada + avisos
+                # ¿ya está en el carrito?
+                existente = next((c for c in carrito if c["product_id"] == prod["product_id"]), None)
+                if existente:
+                    if accion == "reemplazar":
+                        existente["cantidad"] = pedido_cant   # fija la cantidad
+                    else:
+                        existente["cantidad"] += pedido_cant  # suma a lo que había
+                else:
+                    carrito.append({
+                        "product_id": prod["product_id"],
+                        "product_name": prod["product_name"],
+                        "variant_id": prod["variant_id"],
+                        "precio": prod["precio"],
+                        "cantidad": pedido_cant,
+                    })
             texto = texto_tmp
             if avisos:
                 texto += "\n\n" + "\n".join(avisos)
