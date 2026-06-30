@@ -926,13 +926,14 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
     return agente, texto, json_data
 
 
-def _respuesta_unificada(agente, texto, json_data):
+def _respuesta_unificada(agente, texto, json_data, transcripcion=""):
     jd = json_data or {}
     return {
         "respuesta": texto,
         "mensaje": texto,
         "agente": agente,
         "escalar": bool(jd.get("escalar", False)) if agente == "agente_humano" else False,
+        "transcripcion": transcripcion or "",
     }
 
 
@@ -952,6 +953,7 @@ async def orquestador(request: Request):
     contact_id = str(body.get("contact_id", "")).strip()
     mensaje = body.get("mensaje_usuario", "") or ""
     mensaje_audio = (body.get("mensaje_audio", "") or "").strip()
+
     # ManyChat no deja vaciar un campo desde la UI; usamos un valor centinela.
     # Si mensaje_audio trae un marcador (none, vacio, -, etc.), lo tratamos como "sin audio".
     if mensaje_audio.lower() in ("none", "null", "vacio", "vacío", "-", "n/a", "na", ""):
@@ -966,12 +968,15 @@ async def orquestador(request: Request):
     if not tenant:
         return JSONResponse(_respuesta_unificada("charla", "No encontré la configuración de este negocio. Avisá al administrador.", {}))
 
+    transcripcion = ""  # se llena solo si el mensaje fue un audio
+
     # AUDIO: viene en su campo dedicado mensaje_audio (URL del archivo desde ManyChat)
     if mensaje_audio and mensaje_audio.lower().startswith("http"):
         transcripto = await transcribir_audio(mensaje_audio)
         if not transcripto:
             return JSONResponse(_respuesta_unificada("charla", "No pude escuchar bien el audio 🙉 ¿me lo escribís o lo mandás de nuevo?", {}))
         mensaje = transcripto
+        transcripcion = transcripto
     else:
         # Si no hay audio, evaluar si mensaje_usuario es texto o imagen (URL)
         tipo_msg = tipo_de_url(mensaje)
@@ -992,8 +997,14 @@ async def orquestador(request: Request):
             if not transcripto:
                 return JSONResponse(_respuesta_unificada("charla", "No pude escuchar bien el audio 🙉 ¿me lo escribís?", {}))
             mensaje = transcripto
+            transcripcion = transcripto
+
+    # 'transcripcion' siempre lleva el mensaje del cliente EN TEXTO:
+    # si fue audio, ya tiene la transcripción; si no, usamos el texto/mensaje resuelto.
+    if not transcripcion:
+        transcripcion = mensaje
 
     agente, texto, json_data = await manejar_turno(tenant, contact_id, mensaje)
     if texto is None:
-        return JSONResponse(_respuesta_unificada("charla", "Tardé más de lo esperado. ¿Podés repetir tu mensaje?", {}))
-    return JSONResponse(_respuesta_unificada(agente, texto, json_data))
+        return JSONResponse(_respuesta_unificada("charla", "Tardé más de lo esperado. ¿Podés repetir tu mensaje?", {}, transcripcion))
+    return JSONResponse(_respuesta_unificada(agente, texto, json_data, transcripcion))
