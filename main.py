@@ -683,6 +683,11 @@ async def transcribir_audio(audio_url: str) -> str:
                 files={"file": ("audio.ogg", audio_bytes, "audio/ogg")},
                 data={"model": "whisper-1", "language": "es"}
             )
+
+        print("=== RESPUESTA ANTHROPIC ===")
+        print("Status:", r.status_code)
+        print(r.text)
+
         data = r.json()
         if "text" not in data:
             print(f"[transcribir_audio] sin text | status={r.status_code} resp={data}")
@@ -699,6 +704,12 @@ async def leer_imagen(imagen_url: str, lista_catalogo: str) -> dict:
     try:
         async with httpx.AsyncClient(timeout=60) as client:
             ir = await client.get(imagen_url)
+
+            print("=== IMAGEN DESCARGADA ===")
+            print("Status:", ir.status_code)
+            print("Content-Type:", ir.headers.get("content-type"))
+            print("Bytes:", len(ir.content))
+
             if ir.status_code != 200:
                 print(f"[leer_imagen] descarga falló status={ir.status_code}")
                 return {"tipo": "error", "items": [], "texto": ""}
@@ -747,6 +758,11 @@ Respondé SOLO con este JSON:
                     }]
                 }
             )
+
+        print("=== RESPUESTA ANTHROPIC ===")
+        print("Status:", r.status_code)
+        print(r.text)
+
         data = r.json()
         if "content" not in data:
             print(f"[leer_imagen] sin content | status={r.status_code} resp={data}")
