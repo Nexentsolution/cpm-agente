@@ -984,6 +984,10 @@ async def orquestador(request: Request):
 
     tipo_media = tipo_de_url(url_media) if url_media else "texto"
 
+    # LOG DIAGNÓSTICO — borrar tras la prueba
+    print(f"[DIAG] mensaje='{mensaje}' | mensaje_audio='{mensaje_audio}'")
+    print(f"[DIAG] url_media='{url_media}' | tipo_media='{tipo_media}'")
+
     if tipo_media == "audio":
         transcripto = await transcribir_audio(url_media)
         if not transcripto:
