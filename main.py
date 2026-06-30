@@ -396,16 +396,17 @@ def prompt_router(cfg: dict) -> str:
 PERO AHORA actuás como CLASIFICADOR INTERNO. NO le hablás al contacto. Leé el último mensaje y el historial reciente y decidí qué área responde. Devolvé SOLO un JSON: {{"ruta": "ASESOR"}}
 
 Rutas:
-- ASESOR: consulta sobre productos (qué hay, características, precios, disponibilidad, recomendaciones, "qué me conviene").
-- PEDIDO: el contacto quiere comprar / agregar productos / armar o confirmar un pedido ("quiero 3 de esto", "agregá", "cerrá el pedido", "cuánto sería").
+- ASESOR: consulta sobre productos cuando NO hay un pedido en curso (qué hay, características, precios, disponibilidad, recomendaciones, "qué me conviene").
+- PEDIDO: el contacto quiere comprar / agregar productos / armar o confirmar un pedido ("quiero 3 de esto", "agregá", "cerrá el pedido"). TAMBIÉN cae acá CUALQUIER pregunta cuando hay un pedido en curso: precio, total, "cuánto es", "cómo queda el pedido", resumen, sacar o cambiar items. Si hay pedido en curso, quedate en PEDIDO.
 - CONTINUAR: responde a algo que se le venía preguntando (un dato, una cantidad, una confirmación "sí"/"dale", una dirección).
 - CHARLA: saludo, cortesía, agradecimiento, sin intención concreta.
 - AGENTE_HUMANO: SOLO si pide explícitamente hablar con una persona real.
 
 REGLAS:
-- Si hay TAREA EN CURSO y el contacto sigue el hilo → CONTINUAR.
+- Si hay un PEDIDO EN CURSO (carrito con productos o tarea de pedido), las preguntas sobre precio, total o el estado del pedido van a PEDIDO, NO a ASESOR. El agente de pedido tiene los precios y el carrito.
+- Si hay TAREA EN CURSO y el contacto sigue el hilo → CONTINUAR o PEDIDO según corresponda.
 - AGENTE_HUMANO solo ante pedido explícito de un humano. Nunca por las dudas.
-- Ante duda: si hay tarea en curso, CONTINUAR; si no, CHARLA.
+- Ante duda: si hay pedido/tarea en curso, quedate ahí; si no, CHARLA.
 
 Devolvé SOLO {{"ruta": "..."}}."""
 
@@ -762,10 +763,12 @@ RUTAS_VALIDAS = ("ASESOR", "PEDIDO", "CONTINUAR", "CHARLA", "AGENTE_HUMANO")
 AGENTES_CONTENIDO = ("asesor", "pedido", "agente_humano")
 
 
-async def clasificar_ruta(cfg: dict, historial: list, mensaje: str, tarea: str) -> str:
+async def clasificar_ruta(cfg: dict, historial: list, mensaje: str, tarea: str, hay_carrito: bool = False) -> str:
     hist = historial[-6:] if len(historial) > 6 else historial
     contexto = ""
-    if tarea in AGENTES_CONTENIDO:
+    if hay_carrito:
+        contexto = "[CONTEXTO: hay un PEDIDO EN CURSO con productos en el carrito. Cualquier pregunta sobre precio, total, resumen o cambios al pedido es PEDIDO, no ASESOR.]"
+    elif tarea in AGENTES_CONTENIDO:
         contexto = f"[CONTEXTO: hay una tarea de '{tarea}' en curso. Si el contacto sigue el hilo, es CONTINUAR.]"
     contenido = f"{contexto}\nMensaje del contacto: {mensaje}".strip()
     msgs = hist + [{"role": "user", "content": contenido}]
@@ -785,7 +788,11 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
         historial = historial[-40:]
     tarea = conv["tarea"]
 
-    ruta = await clasificar_ruta(cfg, historial, mensaje, tarea)
+    # ¿hay un pedido en curso? (carrito con productos)
+    carrito_previo = conv["pedido"] if isinstance(conv["pedido"], list) else []
+    hay_carrito = len(carrito_previo) > 0
+
+    ruta = await clasificar_ruta(cfg, historial, mensaje, tarea, hay_carrito)
 
     if ruta == "CONTINUAR":
         agente = tarea if tarea in AGENTES_CONTENIDO else "asesor"
@@ -798,8 +805,12 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
     else:
         agente = "charla"
 
+    # Si hay carrito en curso y cae en asesor/charla, forzar pedido (red de seguridad)
+    if hay_carrito and agente in ("asesor", "charla"):
+        agente = "pedido"
+
     # Carrito actual (lo necesita el agente pedido)
-    carrito = conv["pedido"] if isinstance(conv["pedido"], list) else []
+    carrito = carrito_previo
     pedido_registrado = None
 
     historial.append({"role": "user", "content": mensaje})
@@ -939,39 +950,48 @@ async def orquestador(request: Request):
     body = await request.json()
     page_id = str(body.get("page_id", "")).strip()
     contact_id = str(body.get("contact_id", "")).strip()
-    mensaje = body.get("mensaje_usuario", "")
+    mensaje = body.get("mensaje_usuario", "") or ""
+    mensaje_audio = (body.get("mensaje_audio", "") or "").strip()
+    # ManyChat no deja vaciar un campo desde la UI; usamos un valor centinela.
+    # Si mensaje_audio trae un marcador (none, vacio, -, etc.), lo tratamos como "sin audio".
+    if mensaje_audio.lower() in ("none", "null", "vacio", "vacío", "-", "n/a", "na", ""):
+        mensaje_audio = ""
 
     if not page_id:
         return JSONResponse(_respuesta_unificada("charla", "Falta configurar el page_id en el request.", {}))
-    if not contact_id or not mensaje:
+    if not contact_id or (not mensaje and not mensaje_audio):
         return JSONResponse(_respuesta_unificada("charla", "No pude procesar tu mensaje. Intentá de nuevo.", {}))
 
     tenant = await resolver_tenant(page_id)
     if not tenant:
         return JSONResponse(_respuesta_unificada("charla", "No encontré la configuración de este negocio. Avisá al administrador.", {}))
 
-    tipo_msg = tipo_de_url(mensaje)
-
-    # AUDIO: por ahora no se puede capturar desde ManyChat → mensaje prolijo
-    if tipo_msg == "audio":
-        transcripto = await transcribir_audio(mensaje)
+    # AUDIO: viene en su campo dedicado mensaje_audio (URL del archivo desde ManyChat)
+    if mensaje_audio and mensaje_audio.lower().startswith("http"):
+        transcripto = await transcribir_audio(mensaje_audio)
         if not transcripto:
-            return JSONResponse(_respuesta_unificada("charla", "Por ahora no puedo escuchar audios 🙉 ¿me lo escribís?", {}))
+            return JSONResponse(_respuesta_unificada("charla", "No pude escuchar bien el audio 🙉 ¿me lo escribís o lo mandás de nuevo?", {}))
         mensaje = transcripto
-
-    # IMAGEN: leer con visión, extraer productos y cruzar con catálogo
-    elif tipo_msg == "imagen":
-        lista = await get_lista_liviana(tenant["tenant_id"])
-        resultado = await leer_imagen(mensaje, formato_lista_liviana(lista))
-        if resultado["tipo"] == "pedido" and resultado["items"]:
-            # convertir lo que vio en un "mensaje" de pedido para el flujo normal
-            partes = [f"{it.get('cantidad', 1)} x {it.get('producto', '')}" for it in resultado["items"]]
-            mensaje = "Quiero pedir lo de esta imagen: " + ", ".join(partes)
-        elif resultado["tipo"] == "descripcion":
-            return JSONResponse(_respuesta_unificada("charla",
-                f"Vi tu imagen: {resultado['texto']}. ¿Querés que te arme un pedido con algo de esto? Contame qué necesitás.", {}))
-        else:
-            return JSONResponse(_respuesta_unificada("charla", "No pude abrir bien la imagen. ¿Me la mandás de nuevo o me escribís qué necesitás?", {}))
+    else:
+        # Si no hay audio, evaluar si mensaje_usuario es texto o imagen (URL)
+        tipo_msg = tipo_de_url(mensaje)
+        if tipo_msg == "imagen":
+            lista = await get_lista_liviana(tenant["tenant_id"])
+            resultado = await leer_imagen(mensaje, formato_lista_liviana(lista))
+            if resultado["tipo"] == "pedido" and resultado["items"]:
+                partes = [f"{it.get('cantidad', 1)} x {it.get('producto', '')}" for it in resultado["items"]]
+                mensaje = "Quiero pedir lo de esta imagen: " + ", ".join(partes)
+            elif resultado["tipo"] == "descripcion":
+                return JSONResponse(_respuesta_unificada("charla",
+                    f"Vi tu imagen: {resultado['texto']}. ¿Querés que te arme un pedido con algo de esto? Contame qué necesitás.", {}))
+            else:
+                return JSONResponse(_respuesta_unificada("charla", "No pude abrir bien la imagen. ¿Me la mandás de nuevo o me escribís qué necesitás?", {}))
+        elif tipo_msg == "audio":
+            # respaldo: audio que llegó por mensaje_usuario en vez del campo dedicado
+            transcripto = await transcribir_audio(mensaje)
+            if not transcripto:
+                return JSONResponse(_respuesta_unificada("charla", "No pude escuchar bien el audio 🙉 ¿me lo escribís?", {}))
+            mensaje = transcripto
 
     agente, texto, json_data = await manejar_turno(tenant, contact_id, mensaje)
     if texto is None:
