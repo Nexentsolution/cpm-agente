@@ -714,9 +714,12 @@ async def leer_imagen(imagen_url: str, lista_catalogo: str) -> dict:
             else:
                 media_type = "image/jpeg"
 
-            prompt_vision = f"""Sos un asistente que lee imágenes para tomar pedidos de una distribuidora. El cliente mandó una foto que puede ser: una factura/remito anterior, una nota escrita a mano, o una lista de productos.
+            prompt_vision = f"""Sos un asistente que lee imágenes para tomar pedidos de una distribuidora. El cliente puede mandar:
+- Una factura o remito anterior.
+- Una nota o lista escrita a mano o impresa.
+- Una foto de un producto donde se vea su nombre, etiqueta o envase.
 
-Tu tarea: identificá qué PRODUCTOS y CANTIDADES aparecen en la imagen, y cruzalos con este catálogo (usá los nombres EXACTOS del catálogo):
+Tu tarea: identificá qué PRODUCTOS y CANTIDADES aparecen en la imagen, y cruzalos con este catálogo usando los nombres EXACTOS del catálogo. Interpretá con flexibilidad: si en la imagen ves un nombre, fragancia, formato (ml) o tipo de producto que se corresponde con algo del catálogo, hacé el match aunque no esté escrito idéntico (ej. "piso marina 27" → "Bulto Limpiador de Pisos Smart Marina 27ml"). Si no hay cantidad indicada, asumí 1.
 
 CATÁLOGO:
 {lista_catalogo}
@@ -724,8 +727,9 @@ CATÁLOGO:
 Respondé SOLO con este JSON:
 {{"tipo": "pedido" o "descripcion", "items": [{{"producto": "nombre exacto del catálogo", "cantidad": N}}], "texto": "qué ves en la imagen, breve"}}
 
-- Si identificás productos que matchean el catálogo → tipo "pedido", completá items con nombres exactos y cantidades.
-- Si la imagen no tiene productos claros, está borrosa o no se entiende → tipo "descripcion", items vacío, y en "texto" describí brevemente qué ves.
+- Si identificás uno o más productos que matchean el catálogo → tipo "pedido", completá items con nombres exactos y cantidades.
+- Si ves productos que NO están en el catálogo, no los inventes; mencionalos en "texto" pero no los pongas en items.
+- Si la imagen no tiene productos reconocibles, está borrosa o no se entiende → tipo "descripcion", items vacío, y en "texto" describí brevemente qué ves.
 - Nunca inventes productos que no estén en el catálogo."""
 
             r = await client.post(
@@ -970,34 +974,34 @@ async def orquestador(request: Request):
 
     transcripcion = ""  # se llena solo si el mensaje fue un audio
 
-    # AUDIO: viene en su campo dedicado mensaje_audio (URL del archivo desde ManyChat)
+    # Unificar: el contenido multimedia puede llegar por mensaje_audio O mensaje_usuario.
+    # Decidimos qué es por la EXTENSIÓN real del archivo, no por el campo.
+    url_media = ""
     if mensaje_audio and mensaje_audio.lower().startswith("http"):
-        transcripto = await transcribir_audio(mensaje_audio)
+        url_media = mensaje_audio
+    elif tipo_de_url(mensaje) in ("audio", "imagen"):
+        url_media = mensaje
+
+    tipo_media = tipo_de_url(url_media) if url_media else "texto"
+
+    if tipo_media == "audio":
+        transcripto = await transcribir_audio(url_media)
         if not transcripto:
             return JSONResponse(_respuesta_unificada("charla", "No pude escuchar bien el audio 🙉 ¿me lo escribís o lo mandás de nuevo?", {}))
         mensaje = transcripto
         transcripcion = transcripto
-    else:
-        # Si no hay audio, evaluar si mensaje_usuario es texto o imagen (URL)
-        tipo_msg = tipo_de_url(mensaje)
-        if tipo_msg == "imagen":
-            lista = await get_lista_liviana(tenant["tenant_id"])
-            resultado = await leer_imagen(mensaje, formato_lista_liviana(lista))
-            if resultado["tipo"] == "pedido" and resultado["items"]:
-                partes = [f"{it.get('cantidad', 1)} x {it.get('producto', '')}" for it in resultado["items"]]
-                mensaje = "Quiero pedir lo de esta imagen: " + ", ".join(partes)
-            elif resultado["tipo"] == "descripcion":
-                return JSONResponse(_respuesta_unificada("charla",
-                    f"Vi tu imagen: {resultado['texto']}. ¿Querés que te arme un pedido con algo de esto? Contame qué necesitás.", {}))
-            else:
-                return JSONResponse(_respuesta_unificada("charla", "No pude abrir bien la imagen. ¿Me la mandás de nuevo o me escribís qué necesitás?", {}))
-        elif tipo_msg == "audio":
-            # respaldo: audio que llegó por mensaje_usuario en vez del campo dedicado
-            transcripto = await transcribir_audio(mensaje)
-            if not transcripto:
-                return JSONResponse(_respuesta_unificada("charla", "No pude escuchar bien el audio 🙉 ¿me lo escribís?", {}))
-            mensaje = transcripto
-            transcripcion = transcripto
+
+    elif tipo_media == "imagen":
+        lista = await get_lista_liviana(tenant["tenant_id"])
+        resultado = await leer_imagen(url_media, formato_lista_liviana(lista))
+        if resultado["tipo"] == "pedido" and resultado["items"]:
+            partes = [f"{it.get('cantidad', 1)} x {it.get('producto', '')}" for it in resultado["items"]]
+            mensaje = "Quiero pedir lo de esta imagen: " + ", ".join(partes)
+        elif resultado["tipo"] == "descripcion":
+            return JSONResponse(_respuesta_unificada("charla",
+                f"Vi tu imagen: {resultado['texto']}. ¿Querés que te arme un pedido con algo de esto? Contame qué necesitás.", {}))
+        else:
+            return JSONResponse(_respuesta_unificada("charla", "No pude abrir bien la imagen. ¿Me la mandás de nuevo o me escribís qué necesitás?", {}))
 
     # 'transcripcion' siempre lleva el mensaje del cliente EN TEXTO:
     # si fue audio, ya tiene la transcripción; si no, usamos el texto/mensaje resuelto.
