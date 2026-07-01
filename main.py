@@ -480,14 +480,19 @@ CÓMO TRABAJÁS:
 - PRECIOS: si el cliente pregunta el precio o el total, DECÍSELO. Los precios están en el carrito de abajo. Nunca digas que "no tenés los precios" — sí los tenés. Informá el total cuando lo pidan.
 
 CONFIRMACIÓN (importante):
-- Cuando el cliente quiera cerrar, mostrá el resumen con el total y pedí confirmación EXPLÍCITA: "¿Confirmás el pedido?".
+- Cuando el cliente quiera cerrar, pedí confirmación EXPLÍCITA: "¿Confirmás el pedido?".
 - Marcá accion "confirmar" SOLO si el cliente confirma de forma clara: "confirmo", "sí, cerrá", "dale cerralo", "está bien cerrá". 
 - Si el cliente dice algo ambiguo como "si" mientras pregunta otra cosa (ej. "si, cuánto es?"), NO es una confirmación: respondé su pregunta y volvé a pedir confirmación explícita. Ante la duda, NO confirmes.
+
+FORMATO DE TU RESPUESTA (muy importante):
+- NUNCA escribas tablas, listas de productos ni el detalle del pedido en tu texto. El sistema muestra automáticamente una imagen con el resumen (productos, cantidades, precios y total). Vos solo escribí un texto corto y natural.
+- Ejemplo correcto al agregar productos: "Perfecto, te dejo el resumen 👇 ¿Confirmás el pedido o querés sumar algo más?"
+- No repitas los productos ni los precios en texto: la imagen ya los muestra. Mantené tu mensaje breve y cálido.
 
 CATÁLOGO (nombres exactos):
 {lista_txt}
 
-CARRITO ACTUAL (con precios):
+CARRITO ACTUAL (con precios, solo para tu referencia — NO lo copies en el texto):
 {carrito_txt}
 
 Respondé SIEMPRE con texto al cliente + este JSON al final (el cliente NO ve el JSON):
@@ -1014,6 +1019,7 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
         )
         texto_tmp, jd_ped = parsear_respuesta(raw)
         accion = (jd_ped.get("accion") or "nada").lower()
+        print(f"[DIAG-PEDIDO] accion='{accion}' | jd_ped={jd_ped} | raw={raw[:200]}")
 
         if accion in ("agregar", "reemplazar"):
             items_ped = jd_ped.get("items") or []
@@ -1047,14 +1053,6 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
             texto = texto_tmp
             if avisos:
                 texto += "\n\n" + "\n".join(avisos)
-            # Generar imagen del resumen (reemplaza la tabla de texto)
-            if carrito:
-                from datetime import timedelta
-                delivery = (datetime.utcnow() + timedelta(days=1)).date().strftime("%d/%m/%Y")
-                imagen_url = await generar_imagen_pedido(tenant_id, cfg, carrito, delivery)
-                if not imagen_url:
-                    # si falla la imagen, caemos a la tabla de texto como respaldo
-                    texto += "\n\n" + formato_tabla_pedido(carrito)
 
         elif accion == "confirmar":
             if not carrito:
@@ -1070,6 +1068,16 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
                     texto = "Tuve un problema al registrar el pedido. ¿Probamos de nuevo en un momento?"
         else:
             texto = texto_tmp
+
+        # IMAGEN DEL RESUMEN: se genera siempre que quede carrito con productos y NO se haya
+        # confirmado (cubre agregar, reemplazar, y pedir resumen/cotización con accion "nada").
+        if carrito and not pedido_registrado:
+            from datetime import timedelta
+            delivery = (datetime.utcnow() + timedelta(days=1)).date().strftime("%d/%m/%Y")
+            imagen_url = await generar_imagen_pedido(tenant_id, cfg, carrito, delivery)
+            if not imagen_url:
+                # respaldo: si falla la imagen, mostramos la tabla de texto
+                texto += "\n\n" + formato_tabla_pedido(carrito)
     else:  # agente_humano
         raw = await llamar_claude(prompt_agente_humano(cfg), historial, max_tokens=200)
 
