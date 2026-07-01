@@ -484,10 +484,10 @@ CONFIRMACIÓN (importante):
 - Marcá accion "confirmar" SOLO si el cliente confirma de forma clara: "confirmo", "sí, cerrá", "dale cerralo", "está bien cerrá". 
 - Si el cliente dice algo ambiguo como "si" mientras pregunta otra cosa (ej. "si, cuánto es?"), NO es una confirmación: respondé su pregunta y volvé a pedir confirmación explícita. Ante la duda, NO confirmes.
 
-FORMATO DE TU RESPUESTA (muy importante):
-- NUNCA escribas tablas, listas de productos ni el detalle del pedido en tu texto. El sistema muestra automáticamente una imagen con el resumen (productos, cantidades, precios y total). Vos solo escribí un texto corto y natural.
-- Ejemplo correcto al agregar productos: "Perfecto, te dejo el resumen 👇 ¿Confirmás el pedido o querés sumar algo más?"
-- No repitas los productos ni los precios en texto: la imagen ya los muestra. Mantené tu mensaje breve y cálido.
+FORMATO DE TU RESPUESTA (CRÍTICO — leer con atención):
+- Está TERMINANTEMENTE PROHIBIDO escribir tablas, listas de productos, o el detalle del pedido (con "|", con guiones, o en cualquier formato) en tu texto. JAMÁS. El sistema muestra AUTOMÁTICAMENTE una imagen con el resumen. Si vos escribís la tabla, se duplica y se ve mal.
+- Cuando agregás productos o te piden el resumen/cotización, tu texto debe ser CORTO y sin detalle. Ejemplo: "¡Listo! Acá te dejo el resumen 👇 ¿Confirmás o sumás algo más?". La imagen muestra los productos, no vos.
+- Si el CARRITO ACTUAL está vacío o dice "(vacío)", significa que NO hay pedido en curso (puede que ya se haya confirmado). En ese caso NO inventes ni recuerdes productos de antes: decí que no hay un pedido activo y preguntá qué querés pedir. NUNCA armes una tabla con datos que no están en el carrito actual.
 
 CATÁLOGO (nombres exactos):
 {lista_txt}
@@ -1071,10 +1071,12 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
 
         # IMAGEN DEL RESUMEN: se genera siempre que quede carrito con productos y NO se haya
         # confirmado (cubre agregar, reemplazar, y pedir resumen/cotización con accion "nada").
+        print(f"[DIAG-IMG] carrito_items={len(carrito)} | pedido_registrado={bool(pedido_registrado)}")
         if carrito and not pedido_registrado:
             from datetime import timedelta
             delivery = (datetime.utcnow() + timedelta(days=1)).date().strftime("%d/%m/%Y")
             imagen_url = await generar_imagen_pedido(tenant_id, cfg, carrito, delivery)
+            print(f"[DIAG-IMG] imagen_url='{imagen_url}'")
             if not imagen_url:
                 # respaldo: si falla la imagen, mostramos la tabla de texto
                 texto += "\n\n" + formato_tabla_pedido(carrito)
