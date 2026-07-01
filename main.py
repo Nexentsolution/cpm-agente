@@ -576,6 +576,167 @@ def total_pedido(items: list) -> float:
     return sum(it["precio"] * it["cantidad"] for it in items)
 
 
+# ─────────────────────────────────────────────
+# IMAGEN DEL RESUMEN DE PEDIDO
+# ─────────────────────────────────────────────
+
+_LOGO_CACHE = {}  # cache del logo descargado por URL
+
+def _cargar_fuente(size: int, bold: bool = False):
+    from PIL import ImageFont
+    base = "/usr/share/fonts/truetype/liberation/"
+    nombre = "LiberationSans-Bold.ttf" if bold else "LiberationSans-Regular.ttf"
+    try:
+        return ImageFont.truetype(base + nombre, size)
+    except Exception:
+        return ImageFont.load_default()
+
+
+async def _get_logo(logo_url: str):
+    """Descarga el logo (con cache en memoria). Devuelve imagen PIL o None."""
+    if not logo_url:
+        return None
+    if logo_url in _LOGO_CACHE:
+        return _LOGO_CACHE[logo_url]
+    try:
+        from PIL import Image
+        import io
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(logo_url)
+            if r.status_code != 200:
+                return None
+        logo = Image.open(io.BytesIO(r.content)).convert("RGBA")
+        _LOGO_CACHE[logo_url] = logo
+        return logo
+    except Exception as e:
+        print(f"[_get_logo] error: {e}")
+        return None
+
+
+async def generar_imagen_pedido(tenant_id: str, cfg: dict, items: list, delivery: str = "") -> str:
+    """Genera la imagen del resumen y la sube a Supabase Storage. Devuelve la URL pública o ''."""
+    try:
+        from PIL import Image, ImageDraw
+        import io, time
+
+        VIOLETA = (123, 77, 224)
+        VIOLETA_OSCURO = (74, 61, 158)
+        BLANCO = (255, 255, 255)
+        GRIS_CLARO = (245, 245, 247)
+        GRIS_TEXTO = (90, 90, 100)
+        NEGRO_LOGO = (10, 10, 15)
+        NEGRO = (30, 30, 35)
+
+        nombre_negocio = cfg.get("rubro") or cfg.get("bot_nombre") or "Pedido"
+        logo_url = cfg.get("logo_url", "")
+
+        W = 800
+        logo_h = 150 if logo_url else 0
+        header_h = 70
+        tabla_head = 68
+        row_h = 58
+        footer_h = 140
+        H = logo_h + header_h + tabla_head + row_h * len(items) + footer_h
+
+        img = Image.new("RGB", (W, H), BLANCO)
+        d = ImageDraw.Draw(img)
+
+        # Logo
+        if logo_url:
+            d.rectangle([0, 0, W, logo_h], fill=NEGRO_LOGO)
+            logo = await _get_logo(logo_url)
+            if logo:
+                lw, lh = logo.size
+                nh = 120
+                nw = int(lw * nh / lh)
+                logo = logo.resize((nw, nh))
+                img.paste(logo, ((W - nw) // 2, (logo_h - nh) // 2), logo)
+
+        # Banda violeta con nombre
+        y0 = logo_h
+        d.rectangle([0, y0, W, y0 + header_h], fill=VIOLETA)
+        f_neg = _cargar_fuente(26, True)
+        # achicar si el nombre es largo
+        s = 26
+        while d.textlength(nombre_negocio, font=_cargar_fuente(s, True)) > W - 80 and s > 14:
+            s -= 1
+        d.text((40, y0 + (header_h - s) // 2 - 2), nombre_negocio, font=_cargar_fuente(s, True), fill=BLANCO)
+
+        # Título
+        y = y0 + header_h + 20
+        d.text((40, y), "RESUMEN DE PEDIDO", font=_cargar_fuente(22, True), fill=VIOLETA_OSCURO)
+
+        # Cabecera tabla
+        y += 42
+        d.text((40, y), "Producto", font=_cargar_fuente(17, True), fill=GRIS_TEXTO)
+        d.text((W - 215, y), "Cant", font=_cargar_fuente(17, True), fill=GRIS_TEXTO)
+        d.text((W - 130, y), "Precio", font=_cargar_fuente(17, True), fill=GRIS_TEXTO)
+        y += 26
+        d.line([40, y, W - 40, y], fill=VIOLETA, width=2)
+        y += 8
+
+        # Filas
+        total = 0
+        for i, it in enumerate(items):
+            if i % 2 == 0:
+                d.rectangle([40, y, W - 40, y + row_h - 8], fill=GRIS_CLARO)
+            nombre = it["product_name"]
+            # achicar fuente hasta que entre
+            fs = 16
+            while d.textlength(nombre, font=_cargar_fuente(fs)) > W - 260 and fs > 11:
+                fs -= 1
+            d.text((50, y + 16), nombre, font=_cargar_fuente(fs), fill=NEGRO)
+            d.text((W - 205, y + 16), str(it["cantidad"]), font=_cargar_fuente(16), fill=NEGRO)
+            subtotal = it["precio"] * it["cantidad"]
+            total += subtotal
+            precio = f"${subtotal:,.0f}".replace(",", ".")
+            d.text((W - 130, y + 16), precio, font=_cargar_fuente(16), fill=NEGRO)
+            y += row_h
+
+        # Total
+        y += 6
+        d.line([40, y, W - 40, y], fill=VIOLETA, width=2)
+        y += 18
+        d.rectangle([W - 330, y, W - 40, y + 52], fill=VIOLETA)
+        d.text((W - 315, y + 13), "TOTAL", font=_cargar_fuente(22, True), fill=BLANCO)
+        tot = f"${total:,.0f}".replace(",", ".")
+        d.text((W - 40 - d.textlength(tot, font=_cargar_fuente(22, True)) - 15, y + 13),
+               tot, font=_cargar_fuente(22, True), fill=BLANCO)
+
+        # Footer
+        y += 78
+        if delivery:
+            d.text((40, y), f"Entrega estimada: {delivery}", font=_cargar_fuente(15), fill=GRIS_TEXTO)
+        d.text((40, y + 24), "Pendiente de confirmación", font=_cargar_fuente(15, True), fill=VIOLETA)
+
+        # Exportar a bytes
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        png_bytes = buf.getvalue()
+
+        # Subir a Supabase Storage (bucket 'pedidos')
+        nombre_archivo = f"{tenant_id}/{int(time.time()*1000)}.png"
+        async with httpx.AsyncClient(timeout=20) as client:
+            up = await client.post(
+                f"{SUPABASE_URL}/storage/v1/object/pedidos/{nombre_archivo}",
+                headers={
+                    "Authorization": f"Bearer {SUPABASE_KEY}",
+                    "apikey": SUPABASE_KEY,
+                    "Content-Type": "image/png",
+                    "x-upsert": "true",
+                },
+                content=png_bytes,
+            )
+        if up.status_code not in (200, 201):
+            print(f"[generar_imagen_pedido] fallo upload: {up.status_code} {up.text[:200]}")
+            return ""
+        url_publica = f"{SUPABASE_URL}/storage/v1/object/public/pedidos/{nombre_archivo}"
+        return url_publica
+    except Exception as e:
+        print(f"[generar_imagen_pedido] excepción: {e}")
+        return ""
+
+
 async def registrar_pedido(tenant_id: str, contact_uuid: str, items: list, direccion: str = "") -> dict:
     """Crea orders + order_items y reserva stock. Devuelve {ok, order_id} o {ok: False, error}."""
     from datetime import timedelta
@@ -683,11 +844,6 @@ async def transcribir_audio(audio_url: str) -> str:
                 files={"file": ("audio.ogg", audio_bytes, "audio/ogg")},
                 data={"model": "whisper-1", "language": "es"}
             )
-
-        print("=== RESPUESTA ANTHROPIC ===")
-        print("Status:", r.status_code)
-        print(r.text)
-
         data = r.json()
         if "text" not in data:
             print(f"[transcribir_audio] sin text | status={r.status_code} resp={data}")
@@ -704,12 +860,6 @@ async def leer_imagen(imagen_url: str, lista_catalogo: str) -> dict:
     try:
         async with httpx.AsyncClient(timeout=60) as client:
             ir = await client.get(imagen_url)
-
-            print("=== IMAGEN DESCARGADA ===")
-            print("Status:", ir.status_code)
-            print("Content-Type:", ir.headers.get("content-type"))
-            print("Bytes:", len(ir.content))
-
             if ir.status_code != 200:
                 print(f"[leer_imagen] descarga falló status={ir.status_code}")
                 return {"tipo": "error", "items": [], "texto": ""}
@@ -758,11 +908,6 @@ Respondé SOLO con este JSON:
                     }]
                 }
             )
-
-        print("=== RESPUESTA ANTHROPIC ===")
-        print("Status:", r.status_code)
-        print(r.text)
-
         data = r.json()
         if "content" not in data:
             print(f"[leer_imagen] sin content | status={r.status_code} resp={data}")
@@ -801,6 +946,7 @@ async def clasificar_ruta(cfg: dict, historial: list, mensaje: str, tarea: str, 
 async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
     tenant_id = tenant["tenant_id"]
     cfg = tenant["settings"]
+    imagen_url = ""  # URL de imagen del resumen de pedido, si se genera
 
     conv = await get_conversacion(tenant_id, contact_id)
     historial = conv["historial"]
@@ -901,7 +1047,14 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
             texto = texto_tmp
             if avisos:
                 texto += "\n\n" + "\n".join(avisos)
-            texto += "\n\n" + formato_tabla_pedido(carrito)
+            # Generar imagen del resumen (reemplaza la tabla de texto)
+            if carrito:
+                from datetime import timedelta
+                delivery = (datetime.utcnow() + timedelta(days=1)).date().strftime("%d/%m/%Y")
+                imagen_url = await generar_imagen_pedido(tenant_id, cfg, carrito, delivery)
+                if not imagen_url:
+                    # si falla la imagen, caemos a la tabla de texto como respaldo
+                    texto += "\n\n" + formato_tabla_pedido(carrito)
 
         elif accion == "confirmar":
             if not carrito:
@@ -921,7 +1074,7 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
         raw = await llamar_claude(prompt_agente_humano(cfg), historial, max_tokens=200)
 
     if not raw:
-        return None, None, {}
+        return None, None, {}, ""
 
     if agente != "pedido":
         texto, json_data = parsear_respuesta(raw)
@@ -943,10 +1096,10 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
     })
     await guardar_log(tenant_id, contact_id, agente, mensaje, texto)
 
-    return agente, texto, json_data
+    return agente, texto, json_data, imagen_url
 
 
-def _respuesta_unificada(agente, texto, json_data, transcripcion=""):
+def _respuesta_unificada(agente, texto, json_data, transcripcion="", imagen_pedido=""):
     jd = json_data or {}
     return {
         "respuesta": texto,
@@ -954,6 +1107,7 @@ def _respuesta_unificada(agente, texto, json_data, transcripcion=""):
         "agente": agente,
         "escalar": bool(jd.get("escalar", False)) if agente == "agente_humano" else False,
         "transcripcion": transcripcion or "",
+        "imagen_pedido": imagen_pedido or "",
     }
 
 
@@ -963,7 +1117,7 @@ def _respuesta_unificada(agente, texto, json_data, transcripcion=""):
 
 @app.get("/")
 async def health():
-    return {"status": "CPM activo — multi-tenant + catálogo + pedidos + imágenes (Capa 1-5)"}
+    return {"status": "CPM activo — multi-tenant + catálogo + pedidos + imágenes + resumen visual (Capa 1-5+)"}
 
 
 @app.post("/orquestador")
@@ -990,19 +1144,36 @@ async def orquestador(request: Request):
 
     transcripcion = ""  # se llena solo si el mensaje fue un audio
 
-    # Unificar: el contenido multimedia puede llegar por mensaje_audio O mensaje_usuario.
-    # Decidimos qué es por la EXTENSIÓN real del archivo, no por el campo.
+    # Detección de media. REGLA CLARA para evitar cruces:
+    # - El AUDIO viene SIEMPRE por el campo dedicado mensaje_audio. Es la única fuente de audio.
+    # - mensaje_usuario es SOLO texto o imagen. Si trae una URL de audio, es contaminación
+    #   de un turno anterior → la ignoramos (no la transcribimos, no la usamos como texto).
     url_media = ""
-    if mensaje_audio and mensaje_audio.lower().startswith("http"):
-        url_media = mensaje_audio
-    elif tipo_de_url(mensaje) in ("audio", "imagen"):
-        url_media = mensaje
+    tipo_media = "texto"
 
-    tipo_media = tipo_de_url(url_media) if url_media else "texto"
+    if mensaje_audio and mensaje_audio.lower().startswith("http"):
+        t = tipo_de_url(mensaje_audio)
+        if t == "audio":
+            url_media = mensaje_audio
+            tipo_media = "audio"
+        elif t == "imagen":
+            # una imagen cayó en el campo de audio: la tratamos como imagen
+            url_media = mensaje_audio
+            tipo_media = "imagen"
+
+    # Si no hubo media por el campo dedicado, evaluamos mensaje_usuario
+    if tipo_media == "texto":
+        t = tipo_de_url(mensaje)
+        if t == "imagen":
+            url_media = mensaje
+            tipo_media = "imagen"
+        elif t == "audio":
+            # URL de audio en mensaje_usuario = contaminación de turno anterior → ignorar
+            mensaje = ""
 
     # LOG DIAGNÓSTICO — borrar tras la prueba
-    print(f"[DIAG] mensaje='{mensaje}' | mensaje_audio='{mensaje_audio}'")
-    print(f"[DIAG] url_media='{url_media}' | tipo_media='{tipo_media}'")
+    print(f"[DIAG] mensaje='{mensaje[:60]}' | mensaje_audio='{mensaje_audio[:60]}'")
+    print(f"[DIAG] url_media='{url_media[:60]}' | tipo_media='{tipo_media}'")
 
     if tipo_media == "audio":
         transcripto = await transcribir_audio(url_media)
@@ -1028,7 +1199,7 @@ async def orquestador(request: Request):
     if not transcripcion:
         transcripcion = mensaje
 
-    agente, texto, json_data = await manejar_turno(tenant, contact_id, mensaje)
+    agente, texto, json_data, imagen_url = await manejar_turno(tenant, contact_id, mensaje)
     if texto is None:
         return JSONResponse(_respuesta_unificada("charla", "Tardé más de lo esperado. ¿Podés repetir tu mensaje?", {}, transcripcion))
-    return JSONResponse(_respuesta_unificada(agente, texto, json_data, transcripcion))
+    return JSONResponse(_respuesta_unificada(agente, texto, json_data, transcripcion, imagen_url))
