@@ -22,6 +22,7 @@ ANTHROPIC_KEY = os.environ["ANTHROPIC_KEY"]
 MANYCHAT_API_KEY = os.environ.get("MANYCHAT_API_KEY", "")
 OPENAI_KEY = os.environ.get("OPENAI_KEY", "")
 MODELO = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+CPM_API_URL = os.environ.get("CPM_API_URL", "https://cpm-nexent.vercel.app/api/agent")
 
 TABLA_CONV = "conversaciones_cpm"
 TABLA_LOGS = "logs_cpm"
@@ -748,6 +749,134 @@ async def generar_imagen_pedido(tenant_id: str, cfg: dict, items: list, delivery
         return ""
 
 
+# ─────────────────────────────────────────────
+# OPERACIONES DE PEDIDO VÍA ENDPOINTS DEL CPM
+# ─────────────────────────────────────────────
+
+def _headers_cpm():
+    return {"Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json"}
+
+
+async def cpm_crear_pedido(tenant_id: str, manychat_contact_id: str, items: list) -> dict:
+    """POST /orders — crea el pedido en estado pendiente. Devuelve {ok, order_id, order_number}."""
+    payload_items = [{
+        "variant_id": it["variant_id"],
+        "product_id": it["product_id"],
+        "product_name": it["product_name"],
+        "quantity": it["cantidad"],
+        "unit_price": it["precio"],
+    } for it in items]
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.post(
+                f"{CPM_API_URL}/orders",
+                headers=_headers_cpm(),
+                json={"tenant_id": tenant_id, "manychat_contact_id": manychat_contact_id, "items": payload_items},
+            )
+        if r.status_code not in (200, 201):
+            print(f"[cpm_crear_pedido] status={r.status_code} resp={r.text[:200]}")
+            return {"ok": False}
+        data = r.json()
+        return {"ok": True, "order_id": data.get("order_id"), "order_number": data.get("order_number")}
+    except Exception as e:
+        print(f"[cpm_crear_pedido] excepción: {e}")
+        return {"ok": False}
+
+
+async def cpm_consultar_pedidos_cliente(tenant_id: str, manychat_contact_id: str) -> list:
+    """GET /orders?manychat_contact_id — lista de pedidos del cliente con estado e ítems."""
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.get(
+                f"{CPM_API_URL}/orders",
+                headers=_headers_cpm(),
+                params={"tenant_id": tenant_id, "manychat_contact_id": manychat_contact_id},
+            )
+        if r.status_code != 200:
+            print(f"[cpm_consultar_pedidos_cliente] status={r.status_code} resp={r.text[:200]}")
+            return []
+        data = r.json()
+        if isinstance(data, dict):
+            return data.get("orders", [])
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        print(f"[cpm_consultar_pedidos_cliente] excepción: {e}")
+        return []
+
+
+async def cpm_consultar_pedido(tenant_id: str, order_id: str) -> dict:
+    """GET /orders/{id} — pedido completo con ítems (cada uno con su id)."""
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.get(
+                f"{CPM_API_URL}/orders/{order_id}",
+                headers=_headers_cpm(),
+                params={"tenant_id": tenant_id},
+            )
+        if r.status_code != 200:
+            print(f"[cpm_consultar_pedido] status={r.status_code} resp={r.text[:200]}")
+            return {}
+        data = r.json()
+        return data.get("order", data) if isinstance(data, dict) else {}
+    except Exception as e:
+        print(f"[cpm_consultar_pedido] excepción: {e}")
+        return {}
+
+
+async def cpm_cambiar_estado(tenant_id: str, order_id: str, status: str) -> bool:
+    """PATCH /orders/{id}/status — cambia el estado del pedido."""
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.patch(
+                f"{CPM_API_URL}/orders/{order_id}/status",
+                headers=_headers_cpm(),
+                json={"tenant_id": tenant_id, "status": status},
+            )
+        if r.status_code not in (200, 204):
+            print(f"[cpm_cambiar_estado] status={r.status_code} resp={r.text[:200]}")
+            return False
+        return True
+    except Exception as e:
+        print(f"[cpm_cambiar_estado] excepción: {e}")
+        return False
+
+
+async def cpm_editar_items(tenant_id: str, order_id: str, items: list) -> bool:
+    """PATCH /orders/{id}/items — items: [{id, quantity}]."""
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.patch(
+                f"{CPM_API_URL}/orders/{order_id}/items",
+                headers=_headers_cpm(),
+                json={"tenant_id": tenant_id, "items": items},
+            )
+        if r.status_code not in (200, 204):
+            print(f"[cpm_editar_items] status={r.status_code} resp={r.text[:200]}")
+            return False
+        return True
+    except Exception as e:
+        print(f"[cpm_editar_items] excepción: {e}")
+        return False
+
+
+async def cpm_cancelar_pedido(tenant_id: str, order_id: str) -> bool:
+    """POST /orders/{id}/cancel — cancela el pedido."""
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.post(
+                f"{CPM_API_URL}/orders/{order_id}/cancel",
+                headers=_headers_cpm(),
+                json={"tenant_id": tenant_id},
+            )
+        if r.status_code not in (200, 204):
+            print(f"[cpm_cancelar_pedido] status={r.status_code} resp={r.text[:200]}")
+            return False
+        return True
+    except Exception as e:
+        print(f"[cpm_cancelar_pedido] excepción: {e}")
+        return False
+
+
 async def registrar_pedido(tenant_id: str, contact_uuid: str, items: list, direccion: str = "") -> dict:
     """Crea orders + order_items y reserva stock. Devuelve {ok, order_id} o {ok: False, error}."""
     from datetime import timedelta
@@ -1066,11 +1195,14 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
             if not carrito:
                 texto = "No tengo productos en el pedido todavía. ¿Qué te gustaría llevar?"
             else:
-                res = await registrar_pedido(tenant_id, CONTACTO_PRUEBA, carrito, conv.get("direccion", ""))
-                if res["ok"]:
+                # Crear el pedido en el CPM (estado pendiente), vinculado al contacto de ManyChat
+                res = await cpm_crear_pedido(tenant_id, contact_id, carrito)
+                if res.get("ok"):
                     pedido_registrado = res
-                    texto = (f"{texto_tmp}\n\n✅ ¡Pedido registrado! Total: ${res['total']:,.0f}. "
-                             f"Entrega prevista: {res['delivery']}. Te esperamos.")
+                    total = total_pedido(carrito)
+                    num = res.get("order_number", "")
+                    texto = (f"{texto_tmp}\n\n✅ ¡Pedido registrado{f' (N° {num})' if num else ''}! "
+                             f"Total: ${total:,.0f}. En breve el equipo lo confirma. ¡Gracias!")
                     carrito = []
                 else:
                     texto = "Tuve un problema al registrar el pedido. ¿Probamos de nuevo en un momento?"
