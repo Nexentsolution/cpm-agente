@@ -475,7 +475,8 @@ Tu rol ahora: TOMAR EL PEDIDO. Se vende por bulto entero. Atendé con naturalida
 
 CÓMO TRABAJÁS:
 - Identificá qué productos quiere agregar el cliente, usando los nombres EXACTOS del catálogo de abajo.
-- Si el cliente es ambiguo (ej. dice "27" que es un formato/ml, no una cantidad; o no aclara fragancia/variante), PREGUNTÁ para aclarar ANTES de agregar. Nunca asumas cantidades: si no dice cuántos, asumí 1 bulto pero aclaralo.
+- Si el cliente nombra un producto que podés identificar sin ambigüedad en el catálogo (aunque no esté escrito idéntico, ej. "limpiador de piso marina 150ml" → "Bulto Limpiador de Pisos Smart Marina 150ml"), AGREGALO DIRECTO con accion "agregar". NO preguntes de más ni muestres el pedido sin actualizarlo. Si no aclara cantidad, asumí 1 bulto y aclaralo en el texto.
+- Preguntá SOLO si hay ambigüedad REAL que te impide elegir el producto: falta la fragancia entre varias opciones, o falta el formato/ml y hay varios. Si el cliente ya dio esos datos, no vuelvas a preguntar.
 - NO agregues un producto que ya está en el carrito de nuevo. Si el cliente corrige la cantidad ("quería 1, no 2"), usá accion "reemplazar" para fijar la cantidad correcta, no "agregar".
 - PRECIOS: si el cliente pregunta el precio o el total, DECÍSELO. Los precios están en el carrito de abajo. Nunca digas que "no tenés los precios" — sí los tenés. Informá el total cuando lo pidan.
 
@@ -499,11 +500,16 @@ Respondé SIEMPRE con texto al cliente + este JSON al final (el cliente NO ve el
 ---JSON---
 {{"accion": "agregar|reemplazar|nada|confirmar", "items": [{{"producto": "Nombre exacto del catálogo", "cantidad": 1}}]}}
 ---FIN---
-- accion "agregar": sumar productos NUEVOS al carrito (los que no estaban).
-- accion "reemplazar": corregir la cantidad de un producto que YA está en el carrito (poné la cantidad final correcta).
-- accion "nada": cuando solo charlás, aclarás dudas, informás precios o preguntás (items vacío).
-- accion "confirmar": SOLO ante confirmación explícita y clara del cliente (items vacío).
-- La cantidad es en bultos."""
+
+REGLAS DEL JSON (CRÍTICO):
+- El bloque ---JSON---...---FIN--- es OBLIGATORIO en CADA respuesta. NUNCA lo omitas, aunque solo estés charlando.
+- Si venías preguntando una cantidad ("¿cuántos bultos?") y el cliente responde un número o confirma, ESE turno DEBE llevar accion "agregar" con el producto y la cantidad. No respondas "listo, anotado" con items vacío: si dijiste que anotabas, el JSON tiene que reflejar el agregado real.
+- accion "agregar": sumar productos NUEVOS al carrito.
+- accion "reemplazar": corregir la cantidad de un producto que YA está en el carrito.
+- accion "resumen": cuando el cliente pide VER el pedido/resumen/cotización sin cambiar nada ("pasame el resumen", "cómo queda", "cuánto es el total", "mostrame el pedido").
+- accion "nada": SOLO cuando de verdad no cambiás el carrito y no piden ver el resumen (una duda puntual, un saludo).
+- accion "confirmar": SOLO ante confirmación explícita del cliente.
+- La cantidad es en bultos. Usá SIEMPRE el nombre exacto del catálogo."""
 
 
 def prompt_agente_humano(cfg: dict) -> str:
@@ -1013,6 +1019,9 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
     elif agente == "pedido":
         lista = await get_lista_liviana(tenant_id)
         carrito_txt = formato_tabla_pedido(carrito) if carrito else "(vacío)"
+        # Snapshot del carrito ANTES de procesar (para detectar cambios reales)
+        import copy
+        carrito_antes = copy.deepcopy(carrito)
         raw = await llamar_claude(
             prompt_pedido(cfg, formato_lista_liviana(lista), carrito_txt),
             historial, max_tokens=600
@@ -1035,13 +1044,12 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
                 if pedido_cant > prod["disponible"]:
                     avisos.append(f"⚠️ {prod['product_name']}: solo hay {prod['disponible']} disponibles, ajusté la cantidad.")
                     pedido_cant = prod["disponible"]
-                # ¿ya está en el carrito?
                 existente = next((c for c in carrito if c["product_id"] == prod["product_id"]), None)
                 if existente:
                     if accion == "reemplazar":
-                        existente["cantidad"] = pedido_cant   # fija la cantidad
+                        existente["cantidad"] = pedido_cant
                     else:
-                        existente["cantidad"] += pedido_cant  # suma a lo que había
+                        existente["cantidad"] += pedido_cant
                 else:
                     carrito.append({
                         "product_id": prod["product_id"],
@@ -1063,16 +1071,19 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
                     pedido_registrado = res
                     texto = (f"{texto_tmp}\n\n✅ ¡Pedido registrado! Total: ${res['total']:,.0f}. "
                              f"Entrega prevista: {res['delivery']}. Te esperamos.")
-                    carrito = []  # vaciar carrito tras registrar
+                    carrito = []
                 else:
                     texto = "Tuve un problema al registrar el pedido. ¿Probamos de nuevo en un momento?"
         else:
             texto = texto_tmp
 
-        # IMAGEN DEL RESUMEN: se genera siempre que quede carrito con productos y NO se haya
-        # confirmado (cubre agregar, reemplazar, y pedir resumen/cotización con accion "nada").
-        print(f"[DIAG-IMG] carrito_items={len(carrito)} | pedido_registrado={bool(pedido_registrado)}")
-        if carrito and not pedido_registrado:
+        # IMAGEN: solo si el carrito CAMBIÓ o si el cliente pidió ver el resumen.
+        def _resumen_carrito(c):
+            return sorted([(x["product_id"], x["cantidad"]) for x in c])
+        cambio = _resumen_carrito(carrito_antes) != _resumen_carrito(carrito)
+        pidio_resumen = accion == "resumen"
+        print(f"[DIAG-IMG] cambio={cambio} | pidio_resumen={pidio_resumen} | items={len(carrito)}")
+        if carrito and not pedido_registrado and (cambio or pidio_resumen):
             from datetime import timedelta
             delivery = (datetime.utcnow() + timedelta(days=1)).date().strftime("%d/%m/%Y")
             imagen_url = await generar_imagen_pedido(tenant_id, cfg, carrito, delivery)
