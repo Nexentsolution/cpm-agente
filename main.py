@@ -104,7 +104,7 @@ async def get_conversacion(tenant_id: str, contact_id: str) -> dict:
             f"{SUPABASE_URL}/rest/v1/{TABLA_CONV}",
             headers=_headers(),
             params={"tenant_id": f"eq.{tenant_id}", "contact_id": f"eq.{contact_id}",
-                    "select": "historial,agente_activo,tarea_pendiente,pedido_en_curso,direccion_entrega"}
+                    "select": "historial,agente_activo,tarea_pendiente,pedido_en_curso,direccion_entrega,ultimo_pedido_fecha,ultimo_pedido_num"}
         )
         data = r.json()
         if isinstance(data, list) and len(data) > 0:
@@ -115,8 +115,11 @@ async def get_conversacion(tenant_id: str, contact_id: str) -> dict:
                 "tarea": str(d.get("tarea_pendiente") or "").strip().lower(),
                 "pedido": d.get("pedido_en_curso") or [],
                 "direccion": d.get("direccion_entrega") or "",
+                "ultimo_pedido_fecha": d.get("ultimo_pedido_fecha") or "",
+                "ultimo_pedido_num": d.get("ultimo_pedido_num") or "",
             }
-        return {"historial": [], "agente_activo": "none", "tarea": "", "pedido": [], "direccion": ""}
+        return {"historial": [], "agente_activo": "none", "tarea": "", "pedido": [], "direccion": "",
+                "ultimo_pedido_fecha": "", "ultimo_pedido_num": ""}
 
 
 async def upsert_conversacion(tenant_id: str, contact_id: str, campos: dict):
@@ -408,10 +411,12 @@ Rutas:
 
 REGLAS:
 - Si hay un PEDIDO EN CURSO (carrito con productos o tarea de pedido), las preguntas sobre precio, total o el estado del pedido van a PEDIDO, NO a ASESOR. El agente de pedido tiene los precios y el carrito.
-- DISTINCIÓN CLAVE PEDIDO vs GESTION: PEDIDO = el carrito que se está armando ahora. GESTION = un pedido que YA se confirmó antes (pregunta por su estado, quiere cancelarlo o modificarlo). Si menciona un número de pedido o pregunta "cómo va / cuándo llega / cancelá", es GESTION aunque haya un carrito.
+- DISTINCIÓN CLAVE PEDIDO vs GESTION: PEDIDO = el carrito que se está armando ahora. GESTION = un pedido que YA se confirmó antes (pregunta por su estado, quiere cancelarlo o modificarlo).
+- PRIORIDAD DE GESTION (importante): si el cliente hace referencia a un pedido ANTERIOR / YA HECHO / YA CONFIRMADO, o menciona un NÚMERO de pedido (ej. "el 1016", "pedido N° 1015"), o pide "sumá/agregá esto AL PEDIDO ANTERIOR / al que hice / al pedido de antes", es GESTION — AUNQUE haya un carrito armándose en este momento. La mención a un pedido previo gana sobre el carrito en curso.
+- Si NO menciona ningún pedido previo y solo está sumando productos al carrito actual, es PEDIDO.
 - Si hay TAREA EN CURSO y el contacto sigue el hilo → CONTINUAR o PEDIDO según corresponda.
 - AGENTE_HUMANO solo ante pedido explícito de un humano. Nunca por las dudas.
-- Ante duda: si hay pedido/tarea en curso, quedate ahí; si no, CHARLA.
+- Ante duda: si hay pedido/tarea en curso y NO refiere a un pedido previo, quedate en PEDIDO; si no, CHARLA.
 
 Devolvé SOLO {{"ruta": "..."}}."""
 
@@ -1161,8 +1166,27 @@ Respondé SOLO con este JSON:
         return {"tipo": "error", "items": [], "texto": ""}
 
 
-RUTAS_VALIDAS = ("ASESOR", "PEDIDO", "CONTINUAR", "CHARLA", "AGENTE_HUMANO")
+RUTAS_VALIDAS = ("ASESOR", "PEDIDO", "GESTION", "CONTINUAR", "CHARLA", "AGENTE_HUMANO")
 AGENTES_CONTENIDO = ("asesor", "pedido", "agente_humano")
+
+
+async def _interpretar_desambiguacion(cfg: dict, mensaje: str) -> str:
+    """Decide si el cliente quiere 'sumar' al pedido de hoy o armar uno 'nuevo'.
+       Devuelve 'sumar' o 'nuevo'. Ante duda, default 'sumar' (decisión de negocio)."""
+    m = (mensaje or "").lower()
+    # Atajos por palabras claras, sin gastar una llamada al modelo
+    if any(k in m for k in ["nuevo", "otro", "aparte", "separado", "distinto", "por separado"]):
+        return "nuevo"
+    if any(k in m for k in ["sum", "agreg", "añad", "anad", "a ese", "al mismo", "al pedido", "junto", "mismo pedido", "ese pedido"]):
+        return "sumar"
+    # Caso ambiguo → una consulta corta al modelo
+    prompt = (f"{_ctx_tenant(cfg)}\n\nEl cliente ya tiene un pedido de hoy y le preguntaste si quiere "
+              f"SUMARLE productos a ese pedido o armar uno NUEVO aparte. Su respuesta fue: \"{mensaje}\".\n"
+              f"Devolvé SOLO una palabra: 'sumar' si quiere agregar al pedido existente, 'nuevo' si quiere uno aparte. "
+              f"Si no queda claro, respondé 'sumar'.")
+    raw = await llamar_claude(prompt, [{"role": "user", "content": mensaje}], max_tokens=10)
+    resp = (raw or "").strip().lower()
+    return "nuevo" if "nuevo" in resp else "sumar"
 
 
 async def clasificar_ruta(cfg: dict, historial: list, mensaje: str, tarea: str, hay_carrito: bool = False) -> str:
@@ -1214,9 +1238,44 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
     if hay_carrito and agente in ("asesor", "charla"):
         agente = "pedido"
 
+    # ── DESAMBIGUACIÓN "pedido del día" (sin consultar CPM, solo con la marca local) ──
+    # Si el cliente arranca un pedido nuevo (no hay carrito) y YA confirmó un pedido HOY,
+    # preguntamos si sumar a ese o armar uno nuevo, en vez de asumir.
+    hoy_iso = datetime.utcnow().date().isoformat()
+    ultimo_ped_fecha = conv.get("ultimo_pedido_fecha", "")
+    ultimo_ped_num = conv.get("ultimo_pedido_num", "")
+    hubo_pedido_hoy = (ultimo_ped_fecha == hoy_iso) and bool(ultimo_ped_num)
+
+    if agente == "pedido" and not hay_carrito and hubo_pedido_hoy and tarea != "desambiguar_pedido":
+        # Interceptar: preguntar antes de armar carrito
+        historial.append({"role": "user", "content": mensaje})
+        texto = (f"Veo que hoy ya hiciste el pedido N° {ultimo_ped_num}. "
+                 f"¿Querés que le sume estos productos a ese pedido, o preferís armar uno nuevo aparte?")
+        historial.append({"role": "assistant", "content": texto})
+        await upsert_conversacion(tenant_id, contact_id, {
+            "historial": historial,
+            "agente_activo": "pedido",
+            "tarea_pendiente": "desambiguar_pedido",
+            "pedido_en_curso": carrito_previo,
+        })
+        await guardar_log(tenant_id, contact_id, "pedido", mensaje, texto)
+        return "pedido", texto, {}, ""
+
+    # Si venís de la pregunta de desambiguación, interpretar la respuesta
+    if tarea == "desambiguar_pedido":
+        eleccion = await _interpretar_desambiguacion(cfg, mensaje)
+        print(f"[DIAG-DESAMB] eleccion={eleccion} | ultimo_num={ultimo_ped_num}")
+        if eleccion == "sumar":
+            agente = "gestion"  # gestión sumará al pedido existente
+        else:
+            agente = "pedido"   # armar carrito nuevo
+        # limpiamos la tarea de desambiguación (ya se resolvió)
+        tarea = ""
+
     # Carrito actual (lo necesita el agente pedido)
     carrito = carrito_previo
     pedido_registrado = None
+    marca_pedido = None  # (fecha_iso, order_number) si se confirma un pedido en este turno
 
     historial.append({"role": "user", "content": mensaje})
 
@@ -1322,6 +1381,8 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
                     num = res.get("order_number", "")
                     texto = (f"{texto_tmp}\n\n✅ ¡Pedido registrado{f' (N° {num})' if num else ''}! "
                              f"Total: ${total:,.0f}. En breve el equipo lo confirma. ¡Gracias!")
+                    # Marca local para desambiguar futuros pedidos del día (sin consultar CPM)
+                    marca_pedido = (datetime.utcnow().date().isoformat(), str(num))
                 else:
                     # El CPM falló, pero NO dejamos el carrito acumulándose entre sesiones.
                     # Se vacía igual; el cliente puede rearmar el pedido si hace falta.
@@ -1353,9 +1414,15 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
         # Gestión de pedidos YA confirmados: consultar estado, modificar (agregar/quitar/cambiar, solo pendiente), cancelar.
         pedidos = await cpm_consultar_pedidos_cliente(tenant_id, contact_id)
         lista_g = await get_lista_liviana(tenant_id)
-        print(f"[DIAG-GESTION] pedidos_encontrados={len(pedidos)}")
+        # Si hay un carrito armándose, puede ser lo que el cliente quiere sumar a un pedido previo
+        carrito_ctx = ""
+        if carrito:
+            prods_carrito = ", ".join(f"{c['cantidad']}x {c['product_name']}" for c in carrito)
+            carrito_ctx = (f"\n\nEL CLIENTE TIENE ESTOS PRODUCTOS SIN CONFIRMAR (carrito actual): {prods_carrito}. "
+                           f"Si pide 'sumá esto / agregá estos al pedido anterior', SON ESTOS productos los que hay que agregar (operacion 'agregar').")
+        print(f"[DIAG-GESTION] pedidos_encontrados={len(pedidos)} | carrito_pendiente={len(carrito)}")
         raw = await llamar_claude(
-            prompt_gestion(cfg, formato_pedidos_gestion(pedidos), formato_lista_liviana(lista_g)),
+            prompt_gestion(cfg, formato_pedidos_gestion(pedidos), formato_lista_liviana(lista_g) + carrito_ctx),
             historial, max_tokens=500
         )
         texto, jd_g = parsear_respuesta(raw)
@@ -1434,8 +1501,16 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
                 print(f"[DIAG-GESTION] modificar payload={payload}")
                 if payload:
                     ok = await cpm_editar_items(tenant_id, oid, payload)
-                    texto = (texto or f"Listo, actualicé tu pedido N° {objetivo.get('order_number', num_g)}.") if ok \
-                        else "No pude aplicar el cambio desde acá. Te paso con el equipo."
+                    if ok:
+                        texto = texto or f"Listo, actualicé tu pedido N° {objetivo.get('order_number', num_g)}."
+                        # Si lo agregado vino del carrito en curso, ya pasó al pedido: vaciarlo
+                        # para que no quede huérfano ni genere un pedido nuevo.
+                        agregados_nuevos = any((c.get("operacion") or "").lower() == "agregar" for c in cambios)
+                        if carrito and agregados_nuevos:
+                            carrito = []
+                            pedido_registrado = {"ok": True, "via_gestion": True}
+                    else:
+                        texto = "No pude aplicar el cambio desde acá. Te paso con el equipo."
                 else:
                     texto = texto or "¿Qué querés cambiar del pedido? Decime el producto y la cantidad."
             else:
@@ -1460,12 +1535,16 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
     # si se registró el pedido, ya no hay tarea de pedido pendiente
     if pedido_registrado:
         nueva_tarea = ""
-    await upsert_conversacion(tenant_id, contact_id, {
+    campos_persist = {
         "historial": historial,
         "agente_activo": agente,
         "tarea_pendiente": nueva_tarea,
         "pedido_en_curso": carrito,
-    })
+    }
+    if marca_pedido:
+        campos_persist["ultimo_pedido_fecha"] = marca_pedido[0]
+        campos_persist["ultimo_pedido_num"] = marca_pedido[1]
+    await upsert_conversacion(tenant_id, contact_id, campos_persist)
     await guardar_log(tenant_id, contact_id, agente, mensaje, texto)
 
     return agente, texto, json_data, imagen_url
