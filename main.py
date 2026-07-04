@@ -23,6 +23,8 @@ MANYCHAT_API_KEY = os.environ.get("MANYCHAT_API_KEY", "")
 OPENAI_KEY = os.environ.get("OPENAI_KEY", "")
 MODELO = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 CPM_API_URL = os.environ.get("CPM_API_URL", "https://cpm-nexent.vercel.app/api/agent")
+# Key para autenticar contra el CPM. Si no se define, usa SUPABASE_KEY (mismo secret).
+CPM_API_KEY = os.environ.get("CPM_API_KEY", os.environ.get("SUPABASE_KEY", ""))
 
 TABLA_CONV = "conversaciones_cpm"
 TABLA_LOGS = "logs_cpm"
@@ -479,7 +481,9 @@ CÓMO TRABAJÁS:
 - Si el cliente nombra un producto que podés identificar sin ambigüedad en el catálogo (aunque no esté escrito idéntico, ej. "limpiador de piso marina 150ml" → "Bulto Limpiador de Pisos Smart Marina 150ml"), AGREGALO DIRECTO con accion "agregar". NO preguntes de más ni muestres el pedido sin actualizarlo. Si no aclara cantidad, asumí 1 bulto y aclaralo en el texto.
 - Preguntá SOLO si hay ambigüedad REAL que te impide elegir el producto: falta la fragancia entre varias opciones, o falta el formato/ml y hay varios. Si el cliente ya dio esos datos, no vuelvas a preguntar.
 - NO agregues un producto que ya está en el carrito de nuevo. Si el cliente corrige la cantidad ("quería 1, no 2"), usá accion "reemplazar" para fijar la cantidad correcta, no "agregar".
-- PRECIOS: si el cliente pregunta el precio o el total, DECÍSELO. Los precios están en el carrito de abajo. Nunca digas que "no tenés los precios" — sí los tenés. Informá el total cuando lo pidan.
+- REGLA DE ORO ANTI-DUPLICADO: mirá el CARRITO ACTUAL de abajo. Si un producto YA figura ahí con la cantidad que el cliente quiere, NO lo vuelvas a incluir en "items" con accion "agregar". Solo usá "agregar" para productos NUEVOS o para CANTIDAD ADICIONAL que el cliente pide explícitamente ("sumale 2 más"). Repetir un "agregar" con lo que ya está DUPLICA el pedido y es un error grave.
+- Cuando el cliente solo REAFIRMA o ACEPTA ("sí", "dale", "confirmo", "correcto", "está bien") SIN nombrar productos ni cantidades nuevas, NUNCA es "agregar". Es "confirmar" (si venías pidiendo confirmación del pedido) o "nada" (si respondía otra cosa). JAMÁS devuelvas "agregar" con los mismos productos del carrito solo porque el cliente dijo "dale".
+- PRECIOS Y ESTADO DEL CARRITO: los datos del CARRITO ACTUAL de abajo son la VERDAD. Si el carrito tiene productos, TENÉS los precios y el total: informalos. Está PROHIBIDO decir "el carrito está vacío", "no tengo los precios" o "no me corresponde tu pedido" cuando el CARRITO ACTUAL de abajo tiene ítems. Si tiene ítems, esos SON el pedido del cliente: trabajá con ellos, no los cuestiones.
 
 CONFIRMACIÓN (importante):
 - Cuando el cliente quiera cerrar, pedí confirmación EXPLÍCITA: "¿Confirmás el pedido?".
@@ -728,7 +732,7 @@ async def generar_imagen_pedido(tenant_id: str, cfg: dict, items: list, delivery
 
         # Subir a Supabase Storage (bucket 'pedidos')
         nombre_archivo = f"{tenant_id}/{int(time.time()*1000)}.png"
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
             up = await client.post(
                 f"{SUPABASE_URL}/storage/v1/object/pedidos/{nombre_archivo}",
                 headers={
@@ -754,7 +758,7 @@ async def generar_imagen_pedido(tenant_id: str, cfg: dict, items: list, delivery
 # ─────────────────────────────────────────────
 
 def _headers_cpm():
-    return {"Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json"}
+    return {"Authorization": f"Bearer {CPM_API_KEY}", "Content-Type": "application/json"}
 
 
 async def cpm_crear_pedido(tenant_id: str, manychat_contact_id: str, items: list) -> dict:
@@ -767,7 +771,7 @@ async def cpm_crear_pedido(tenant_id: str, manychat_contact_id: str, items: list
         "unit_price": it["precio"],
     } for it in items]
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
             r = await client.post(
                 f"{CPM_API_URL}/orders",
                 headers=_headers_cpm(),
@@ -786,7 +790,7 @@ async def cpm_crear_pedido(tenant_id: str, manychat_contact_id: str, items: list
 async def cpm_consultar_pedidos_cliente(tenant_id: str, manychat_contact_id: str) -> list:
     """GET /orders?manychat_contact_id — lista de pedidos del cliente con estado e ítems."""
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
             r = await client.get(
                 f"{CPM_API_URL}/orders",
                 headers=_headers_cpm(),
@@ -807,7 +811,7 @@ async def cpm_consultar_pedidos_cliente(tenant_id: str, manychat_contact_id: str
 async def cpm_consultar_pedido(tenant_id: str, order_id: str) -> dict:
     """GET /orders/{id} — pedido completo con ítems (cada uno con su id)."""
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
             r = await client.get(
                 f"{CPM_API_URL}/orders/{order_id}",
                 headers=_headers_cpm(),
@@ -826,7 +830,7 @@ async def cpm_consultar_pedido(tenant_id: str, order_id: str) -> dict:
 async def cpm_cambiar_estado(tenant_id: str, order_id: str, status: str) -> bool:
     """PATCH /orders/{id}/status — cambia el estado del pedido."""
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
             r = await client.patch(
                 f"{CPM_API_URL}/orders/{order_id}/status",
                 headers=_headers_cpm(),
@@ -844,7 +848,7 @@ async def cpm_cambiar_estado(tenant_id: str, order_id: str, status: str) -> bool
 async def cpm_editar_items(tenant_id: str, order_id: str, items: list) -> bool:
     """PATCH /orders/{id}/items — items: [{id, quantity}]."""
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
             r = await client.patch(
                 f"{CPM_API_URL}/orders/{order_id}/items",
                 headers=_headers_cpm(),
@@ -862,7 +866,7 @@ async def cpm_editar_items(tenant_id: str, order_id: str, items: list) -> bool:
 async def cpm_cancelar_pedido(tenant_id: str, order_id: str) -> bool:
     """POST /orders/{id}/cancel — cancela el pedido."""
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
             r = await client.post(
                 f"{CPM_API_URL}/orders/{order_id}/cancel",
                 headers=_headers_cpm(),
@@ -883,7 +887,7 @@ async def registrar_pedido(tenant_id: str, contact_uuid: str, items: list, direc
     total = total_pedido(items)
     delivery = (datetime.utcnow() + timedelta(days=1)).date().isoformat()
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
             # 1) Crear la orden
             r = await client.post(
                 f"{SUPABASE_URL}/rest/v1/orders",
@@ -1164,6 +1168,27 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
             nombres = [it.get("producto", "") for it in items_ped]
             cants = {it.get("producto", ""): int(it.get("cantidad", 1) or 1) for it in items_ped}
             encontrados = await buscar_producto_para_pedido(tenant_id, nombres)
+
+            # ANTI-DUPLICADO (idempotencia): el modelo suele re-emitir el MISMO
+            # bloque "agregar" cuando el cliente responde "sí"/"dale"/"confirmo"
+            # sin pedir productos nuevos. Si TODOS los productos de este "agregar"
+            # ya están en el carrito con cantidad >= a la pedida, es un re-envío,
+            # no una intención real de sumar más: lo tratamos como no-op.
+            if accion == "agregar" and encontrados:
+                def _cant_en_carrito(pid):
+                    it = next((c for c in carrito if c["product_id"] == pid), None)
+                    return it["cantidad"] if it else 0
+                es_reenvio = all(
+                    _cant_en_carrito(prod["product_id"]) >= cants.get(prod["product_name"], 1)
+                    for prod in encontrados
+                )
+                if es_reenvio:
+                    print(f"[DIAG-PEDIDO] agregar IGNORADO por re-envío (idempotencia): "
+                          f"{[(p['product_name'], cants.get(p['product_name'],1)) for p in encontrados]}")
+                    texto = texto_tmp
+                    accion = "nada"  # neutraliza: no cambia el carrito ni la imagen
+                    encontrados = []
+
             avisos = []
             for prod in encontrados:
                 pedido_cant = cants.get(prod["product_name"], 1)
@@ -1195,17 +1220,23 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
             if not carrito:
                 texto = "No tengo productos en el pedido todavía. ¿Qué te gustaría llevar?"
             else:
+                total = total_pedido(carrito)
                 # Crear el pedido en el CPM (estado pendiente), vinculado al contacto de ManyChat
                 res = await cpm_crear_pedido(tenant_id, contact_id, carrito)
                 if res.get("ok"):
-                    pedido_registrado = res
-                    total = total_pedido(carrito)
                     num = res.get("order_number", "")
                     texto = (f"{texto_tmp}\n\n✅ ¡Pedido registrado{f' (N° {num})' if num else ''}! "
                              f"Total: ${total:,.0f}. En breve el equipo lo confirma. ¡Gracias!")
-                    carrito = []
                 else:
-                    texto = "Tuve un problema al registrar el pedido. ¿Probamos de nuevo en un momento?"
+                    # El CPM falló, pero NO dejamos el carrito acumulándose entre sesiones.
+                    # Se vacía igual; el cliente puede rearmar el pedido si hace falta.
+                    print(f"[cpm_crear_pedido] FALLÓ al confirmar — carrito se vacía igual para no acumular. total=${total:,.0f}")
+                    texto = ("Tomé tu pedido y lo estoy registrando. Si en un rato no te llega la confirmación, "
+                             "escribinos y lo revisamos. ¡Gracias!")
+                # En ambos casos: el pedido se dio por cerrado. Vaciamos el carrito y
+                # marcamos pedido_registrado para que NO se genere imagen ni quede tarea pendiente.
+                pedido_registrado = res if res.get("ok") else {"ok": False, "cerrado": True}
+                carrito = []
         else:
             texto = texto_tmp
 
@@ -1270,7 +1301,7 @@ def _respuesta_unificada(agente, texto, json_data, transcripcion="", imagen_pedi
 
 @app.get("/")
 async def health():
-    return {"status": "CPM activo — multi-tenant + catálogo + pedidos + imágenes + resumen visual (Capa 1-5+)"}
+    return {"status": "CPM activo — multi-tenant + catálogo + pedidos + imágenes + resumen visual + CPM orders (fix 307/idempotencia/no-acumular)"}
 
 
 @app.post("/orquestador")
