@@ -819,6 +819,33 @@ def _headers_cpm():
     return {"Authorization": f"Bearer {CPM_API_KEY}", "Content-Type": "application/json"}
 
 
+def _norm_nombre(s: str) -> str:
+    """Normaliza un nombre de producto para comparar: sin acentos, minúsculas, espacios colapsados."""
+    import unicodedata
+    s = (s or "").strip().lower()
+    s = "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
+    return " ".join(s.split())
+
+
+def _buscar_item_pedido(items_actuales: list, nombre: str):
+    """Encuentra un ítem del pedido por nombre, tolerante a acentos/mayúsculas/espacios.
+       Primero exacto normalizado; si no, por contención (uno dentro del otro)."""
+    objetivo = _norm_nombre(nombre)
+    # 1) match exacto normalizado
+    for it in items_actuales:
+        if _norm_nombre(it.get("product_name", "")) == objetivo:
+            return it
+    # 2) match por contención (el nombre del cliente está contenido en el del pedido o viceversa)
+    for it in items_actuales:
+        n = _norm_nombre(it.get("product_name", ""))
+        if objetivo and (objetivo in n or n in objetivo):
+            return it
+    return None
+
+
+
+
+
 ESTADO_NATURAL = {
     "pendiente": "pendiente (todavía no lo empezó a preparar el local)",
     "en_preparacion": "en preparación (el local ya lo está armando)",
@@ -1480,25 +1507,30 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
                 catalogo_nuevos = await buscar_producto_para_pedido(tenant_id, nombres_nuevos) if nombres_nuevos else []
                 cat_por_nombre = {p["product_name"].lower(): p for p in catalogo_nuevos}
 
+                no_encontrados = []
                 for c in cambios:
                     op = (c.get("operacion") or "").lower()
                     nombre = c.get("producto", "")
                     cant = int(c.get("cantidad", 1) or 1)
-                    existente = next((it for it in items_actuales
-                                      if it.get("product_name", "").lower() == nombre.lower()), None)
+                    existente = _buscar_item_pedido(items_actuales, nombre)
                     if op == "quitar":
                         if existente and existente.get("id"):
                             payload.append({"id": existente["id"], "quantity": 0})
+                        else:
+                            no_encontrados.append(nombre)
                     elif op == "cambiar":
                         if existente and existente.get("id"):
                             payload.append({"id": existente["id"], "quantity": cant})
+                        else:
+                            no_encontrados.append(nombre)
                     elif op == "agregar":
                         # Si ya estaba, "agregar" suma a lo existente → cambiar cantidad total
                         if existente and existente.get("id"):
                             actual = int(existente.get("quantity", 0) or 0)
                             payload.append({"id": existente["id"], "quantity": actual + cant})
                         else:
-                            prod = cat_por_nombre.get(nombre.lower())
+                            prod = cat_por_nombre.get(nombre.lower()) or next(
+                                (p for p in catalogo_nuevos if _norm_nombre(p["product_name"]) == _norm_nombre(nombre)), None)
                             if prod and prod.get("disponible", 0) > 0:
                                 payload.append({
                                     "variant_id": prod["variant_id"],
@@ -1507,7 +1539,9 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
                                     "quantity": cant,
                                     "unit_price": prod["precio"],
                                 })
-                print(f"[DIAG-GESTION] modificar payload={payload}")
+                            else:
+                                no_encontrados.append(nombre)
+                print(f"[DIAG-GESTION] modificar payload={payload} | no_encontrados={no_encontrados}")
                 if payload:
                     ok = await cpm_editar_items(tenant_id, oid, payload)
                     if ok:
@@ -1521,6 +1555,11 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
                             pedido_registrado = {"ok": True, "via_gestion": True}
                     else:
                         texto = "No pude aplicar el cambio desde acá. Te paso con el equipo."
+                elif no_encontrados:
+                    # No se pudo mapear ningún cambio: NO digas "listo" en falso.
+                    prods = ", ".join(no_encontrados)
+                    texto = (f"No encontré {prods} en el pedido N° {objetivo.get('order_number', num_g)} "
+                             f"para modificarlo. ¿Me confirmás el nombre del producto tal como está en el pedido?")
                 else:
                     texto = texto or "¿Qué querés cambiar del pedido? Decime el producto y la cantidad."
             else:
