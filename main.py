@@ -400,13 +400,15 @@ PERO AHORA actuás como CLASIFICADOR INTERNO. NO le hablás al contacto. Leé el
 
 Rutas:
 - ASESOR: consulta sobre productos cuando NO hay un pedido en curso (qué hay, características, precios, disponibilidad, recomendaciones, "qué me conviene").
-- PEDIDO: el contacto quiere comprar / agregar productos / armar o confirmar un pedido ("quiero 3 de esto", "agregá", "cerrá el pedido"). TAMBIÉN cae acá CUALQUIER pregunta cuando hay un pedido en curso: precio, total, "cuánto es", "cómo queda el pedido", resumen, sacar o cambiar items. Si hay pedido en curso, quedate en PEDIDO.
+- PEDIDO: el contacto quiere comprar / agregar productos / armar o confirmar un pedido ("quiero 3 de esto", "agregá", "cerrá el pedido"). TAMBIÉN cae acá CUALQUIER pregunta cuando hay un pedido en curso (carrito armándose): precio, total, "cuánto es", "cómo queda el pedido", resumen, sacar o cambiar items. Si hay pedido en curso, quedate en PEDIDO.
+- GESTION: el contacto pregunta por un pedido YA CONFIRMADO/registrado (no el carrito que se está armando). Señales: "cómo va mi pedido", "estado de mi pedido", "el pedido N° 1015", "ya salió?", "cuándo llega", "cancelá mi pedido", "quiero modificar el pedido que hice", "sacá un producto del pedido que ya confirmé". Es sobre un pedido pasado, no el actual en armado.
 - CONTINUAR: responde a algo que se le venía preguntando (un dato, una cantidad, una confirmación "sí"/"dale", una dirección).
 - CHARLA: saludo, cortesía, agradecimiento, sin intención concreta.
 - AGENTE_HUMANO: SOLO si pide explícitamente hablar con una persona real.
 
 REGLAS:
 - Si hay un PEDIDO EN CURSO (carrito con productos o tarea de pedido), las preguntas sobre precio, total o el estado del pedido van a PEDIDO, NO a ASESOR. El agente de pedido tiene los precios y el carrito.
+- DISTINCIÓN CLAVE PEDIDO vs GESTION: PEDIDO = el carrito que se está armando ahora. GESTION = un pedido que YA se confirmó antes (pregunta por su estado, quiere cancelarlo o modificarlo). Si menciona un número de pedido o pregunta "cómo va / cuándo llega / cancelá", es GESTION aunque haya un carrito.
 - Si hay TAREA EN CURSO y el contacto sigue el hilo → CONTINUAR o PEDIDO según corresponda.
 - AGENTE_HUMANO solo ante pedido explícito de un humano. Nunca por las dudas.
 - Ante duda: si hay pedido/tarea en curso, quedate ahí; si no, CHARLA.
@@ -517,7 +519,53 @@ REGLAS DEL JSON (CRÍTICO):
 - La cantidad es en bultos. Usá SIEMPRE el nombre exacto del catálogo."""
 
 
-def prompt_agente_humano(cfg: dict) -> str:
+def prompt_gestion(cfg: dict, pedidos_txt: str, lista_txt: str) -> str:
+    return f"""{_ctx_tenant(cfg)}
+
+Tu rol ahora: GESTIONAR PEDIDOS YA CONFIRMADOS. El cliente pregunta por el estado de un pedido que ya hizo, o quiere modificarlo (agregar, quitar o cambiar cantidad de productos) o cancelarlo. NO estás armando un carrito nuevo desde cero.
+
+PEDIDOS DEL CLIENTE (datos reales del sistema — son la VERDAD, no inventes nada):
+{pedidos_txt}
+
+CATÁLOGO (nombres exactos — usalos TAL CUAL para agregar productos nuevos):
+{lista_txt}
+
+ESTADOS Y CÓMO NOMBRARLOS AL CLIENTE (NUNCA escribas el nombre técnico con guión bajo, usá la versión natural):
+- pendiente → "pendiente, todavía no lo empezó a preparar el local"
+- en_preparacion → "en preparación, el local ya lo está armando"
+- para_enviar → "listo para salir a reparto"
+- en_entrega → "en camino"
+- entregado → "entregado"
+- cancelado → "cancelado"
+
+REGLAS DE NEGOCIO (respetalas SIEMPRE):
+- MODIFICAR (agregar/quitar/cambiar cantidad): permitido SOLO si el pedido está en estado pendiente. Si está en preparación o más avanzado, NO se puede: explicale con calidez que el local ya lo está preparando y ofrecele hacer un pedido nuevo con lo que quiera sumar.
+- CANCELAR: permitido si el pedido está pendiente, en preparación o listo para salir. NO se puede si ya está en camino o entregado: avisale que hable con el equipo.
+- CONSULTAR estado: siempre se puede.
+
+QUÉ PEDIDO:
+- Si el cliente menciona un número (ej. "pedido 1015"), buscá ese en la lista de arriba.
+- Si no menciona número, asumí el más reciente de la lista.
+- Si no hay pedidos, decile con naturalidad que no encontrás pedidos asociados y ofrecé tomar uno nuevo.
+
+FORMATO: mensajes cortos, cálidos, sin markdown ni tablas ni guiones bajos. Respondé SIEMPRE con texto al cliente + este JSON al final (el cliente NO lo ve):
+---JSON---
+{{"accion_gestion": "consultar|modificar|cancelar|nada", "order_number": "1015 o vacío", "cambios": [{{"producto": "Nombre exacto del catálogo", "cantidad": 2, "operacion": "agregar|cambiar|quitar"}}]}}
+---FIN---
+
+REGLAS DEL JSON:
+- accion_gestion "consultar": el cliente solo quiere saber el estado. cambios vacío.
+- accion_gestion "cancelar": el cliente quiere cancelar. Poné el order_number.
+- accion_gestion "modificar": SOLO si el cliente pide un cambio concreto Y el pedido está pendiente. Poné order_number y cambios.
+- accion_gestion "nada": charla, o cuando el estado NO permite lo que pide (ahí explicás por qué en el texto, sin intentar la acción).
+- En "cambios", cada ítem lleva "operacion":
+  · "agregar" = producto NUEVO que no estaba en el pedido (cantidad = cuántos bultos sumar).
+  · "cambiar" = producto que YA está, nueva cantidad final.
+  · "quitar" = sacar un producto que está en el pedido (cantidad se ignora).
+- Usá SIEMPRE el nombre exacto del catálogo. La cantidad es en bultos."""
+
+
+
     return f"""{_ctx_tenant(cfg)}
 
 El contacto pidió hablar con una persona. Confirmá que ya estás avisando a alguien del comercio para que lo atienda, de forma cálida y breve.
@@ -761,6 +809,49 @@ def _headers_cpm():
     return {"Authorization": f"Bearer {CPM_API_KEY}", "Content-Type": "application/json"}
 
 
+ESTADO_NATURAL = {
+    "pendiente": "pendiente (todavía no lo empezó a preparar el local)",
+    "en_preparacion": "en preparación (el local ya lo está armando)",
+    "para_enviar": "listo para salir a reparto",
+    "en_entrega": "en camino",
+    "entregado": "entregado",
+    "cancelado": "cancelado",
+}
+
+
+def _estado_natural(status: str) -> str:
+    return ESTADO_NATURAL.get((status or "").strip().lower(), (status or "desconocido").replace("_", " "))
+
+
+def formato_pedidos_gestion(pedidos: list) -> str:
+    """Arma el texto de pedidos del cliente para el prompt de gestión."""
+    if not pedidos:
+        return "(el cliente no tiene pedidos registrados)"
+    # ordenar por fecha desc si viene el campo; si no, dejar el orden recibido
+    def _fecha(p):
+        return p.get("created_at") or p.get("createdAt") or ""
+    try:
+        pedidos = sorted(pedidos, key=_fecha, reverse=True)
+    except Exception:
+        pass
+    lineas = []
+    for p in pedidos[:8]:
+        num = p.get("order_number") or p.get("orderNumber") or p.get("id", "?")
+        status = p.get("status", "?")
+        items = p.get("items") or []
+        items_txt = ", ".join(
+            f"{it.get('quantity', it.get('cantidad','?'))}x {it.get('product_name', it.get('producto','producto'))}"
+            for it in items
+        ) or "(sin detalle de ítems)"
+        editable = "SÍ (está pendiente)" if str(status).strip().lower() == "pendiente" else "NO"
+        cancelable = "SÍ" if str(status).strip().lower() in ("pendiente", "en_preparacion", "para_enviar") else "NO"
+        lineas.append(
+            f"- Pedido N° {num} | estado: {_estado_natural(status)} | "
+            f"modificable: {editable} | cancelable: {cancelable} | productos: {items_txt}"
+        )
+    return "\n".join(lineas)
+
+
 async def cpm_crear_pedido(tenant_id: str, manychat_contact_id: str, items: list) -> dict:
     """POST /orders — crea el pedido en estado pendiente. Devuelve {ok, order_id, order_number}."""
     payload_items = [{
@@ -846,7 +937,9 @@ async def cpm_cambiar_estado(tenant_id: str, order_id: str, status: str) -> bool
 
 
 async def cpm_editar_items(tenant_id: str, order_id: str, items: list) -> bool:
-    """PATCH /orders/{id}/items — items: [{id, quantity}]."""
+    """PATCH /orders/{id}/items — incremental. items acepta:
+       {id, quantity} para cambiar cantidad, {id, quantity:0} para quitar,
+       {variant_id, product_id, product_name, quantity, unit_price} para agregar nuevo."""
     try:
         async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
             r = await client.patch(
@@ -1110,6 +1203,8 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
         agente = "asesor"
     elif ruta == "PEDIDO":
         agente = "pedido"
+    elif ruta == "GESTION":
+        agente = "gestion"
     elif ruta == "AGENTE_HUMANO":
         agente = "agente_humano"
     else:
@@ -1254,13 +1349,106 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
             if not imagen_url:
                 # respaldo: si falla la imagen, mostramos la tabla de texto
                 texto += "\n\n" + formato_tabla_pedido(carrito)
+    elif agente == "gestion":
+        # Gestión de pedidos YA confirmados: consultar estado, modificar (agregar/quitar/cambiar, solo pendiente), cancelar.
+        pedidos = await cpm_consultar_pedidos_cliente(tenant_id, contact_id)
+        lista_g = await get_lista_liviana(tenant_id)
+        print(f"[DIAG-GESTION] pedidos_encontrados={len(pedidos)}")
+        raw = await llamar_claude(
+            prompt_gestion(cfg, formato_pedidos_gestion(pedidos), formato_lista_liviana(lista_g)),
+            historial, max_tokens=500
+        )
+        texto, jd_g = parsear_respuesta(raw)
+        acc_g = (jd_g.get("accion_gestion") or "nada").lower()
+        num_g = str(jd_g.get("order_number") or "").strip()
+        print(f"[DIAG-GESTION] accion={acc_g} | order_number={num_g} | jd={jd_g}")
+
+        # Resolver el pedido objetivo: por número si lo dio, si no el más reciente
+        def _match_pedido(p):
+            pn = str(p.get("order_number") or p.get("orderNumber") or p.get("id", "")).strip()
+            return pn == num_g or pn.endswith(num_g)
+        objetivo = None
+        if pedidos:
+            if num_g:
+                objetivo = next((p for p in pedidos if _match_pedido(p)), None)
+            if not objetivo and not num_g:
+                # más reciente
+                try:
+                    objetivo = sorted(pedidos, key=lambda p: p.get("created_at", ""), reverse=True)[0]
+                except Exception:
+                    objetivo = pedidos[0]
+
+        if acc_g == "cancelar" and objetivo:
+            estado = str(objetivo.get("status", "")).strip().lower()
+            oid = objetivo.get("id") or objetivo.get("order_id")
+            if estado in ("pendiente", "en_preparacion", "para_enviar"):
+                ok = await cpm_cancelar_pedido(tenant_id, oid)
+                if ok:
+                    texto = f"Listo, cancelé tu pedido N° {objetivo.get('order_number', num_g)}. Cualquier cosa, acá estoy."
+                else:
+                    texto = "No pude cancelarlo desde acá. Te paso con el equipo para que lo resuelvan."
+            else:
+                texto = (f"Tu pedido N° {objetivo.get('order_number', num_g)} ya está {_estado_natural(estado)}, "
+                         f"así que no lo puedo cancelar desde acá. Escribile al equipo para verlo.")
+
+        elif acc_g == "modificar" and objetivo:
+            estado = str(objetivo.get("status", "")).strip().lower()
+            oid = objetivo.get("id") or objetivo.get("order_id")
+            if estado == "pendiente":
+                cambios = jd_g.get("cambios") or []
+                items_actuales = objetivo.get("items") or []
+                payload = []
+                # Nombres de productos NUEVOS a agregar (necesitan datos de catálogo)
+                nombres_nuevos = [c.get("producto", "") for c in cambios
+                                  if (c.get("operacion") or "").lower() == "agregar"]
+                catalogo_nuevos = await buscar_producto_para_pedido(tenant_id, nombres_nuevos) if nombres_nuevos else []
+                cat_por_nombre = {p["product_name"].lower(): p for p in catalogo_nuevos}
+
+                for c in cambios:
+                    op = (c.get("operacion") or "").lower()
+                    nombre = c.get("producto", "")
+                    cant = int(c.get("cantidad", 1) or 1)
+                    existente = next((it for it in items_actuales
+                                      if it.get("product_name", "").lower() == nombre.lower()), None)
+                    if op == "quitar":
+                        if existente and existente.get("id"):
+                            payload.append({"id": existente["id"], "quantity": 0})
+                    elif op == "cambiar":
+                        if existente and existente.get("id"):
+                            payload.append({"id": existente["id"], "quantity": cant})
+                    elif op == "agregar":
+                        # Si ya estaba, "agregar" suma a lo existente → cambiar cantidad total
+                        if existente and existente.get("id"):
+                            actual = int(existente.get("quantity", 0) or 0)
+                            payload.append({"id": existente["id"], "quantity": actual + cant})
+                        else:
+                            prod = cat_por_nombre.get(nombre.lower())
+                            if prod and prod.get("disponible", 0) > 0:
+                                payload.append({
+                                    "variant_id": prod["variant_id"],
+                                    "product_id": prod["product_id"],
+                                    "product_name": prod["product_name"],
+                                    "quantity": cant,
+                                    "unit_price": prod["precio"],
+                                })
+                print(f"[DIAG-GESTION] modificar payload={payload}")
+                if payload:
+                    ok = await cpm_editar_items(tenant_id, oid, payload)
+                    texto = (texto or f"Listo, actualicé tu pedido N° {objetivo.get('order_number', num_g)}.") if ok \
+                        else "No pude aplicar el cambio desde acá. Te paso con el equipo."
+                else:
+                    texto = texto or "¿Qué querés cambiar del pedido? Decime el producto y la cantidad."
+            else:
+                texto = (f"Tu pedido N° {objetivo.get('order_number', num_g)} ya está {_estado_natural(estado)}, "
+                         f"así que no puedo modificarlo. Si querés, armamos un pedido nuevo con lo que quieras sumar.")
+        # acc_g == "consultar" o "nada": el texto del modelo ya trae la respuesta natural
     else:  # agente_humano
         raw = await llamar_claude(prompt_agente_humano(cfg), historial, max_tokens=200)
 
     if not raw:
         return None, None, {}, ""
 
-    if agente != "pedido":
+    if agente not in ("pedido", "gestion"):
         texto, json_data = parsear_respuesta(raw)
     else:
         json_data = {}
