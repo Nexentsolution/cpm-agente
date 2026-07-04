@@ -567,7 +567,12 @@ REGLAS DEL JSON:
   · "agregar" = producto NUEVO que no estaba en el pedido (cantidad = cuántos bultos sumar).
   · "cambiar" = producto que YA está, nueva cantidad final.
   · "quitar" = sacar un producto que está en el pedido (cantidad se ignora).
-- Usá SIEMPRE el nombre exacto del catálogo. La cantidad es en bultos."""
+- Usá SIEMPRE el nombre exacto del catálogo. La cantidad es en bultos.
+
+CONFIRMACIÓN DE CAMBIOS (CRÍTICO):
+- Cuando el cliente pide un cambio (agregar/quitar/cambiar cantidad), primero PEDÍ confirmación: "¿Confirmás que agrego X al pedido N° Y?" y devolvé accion_gestion "nada" (todavía no ejecutás).
+- Cuando en el turno SIGUIENTE el cliente confirma ("sí", "dale", "confirmo", "correcto"), AHÍ SÍ devolvé accion_gestion "modificar" con el order_number y los cambios EXACTOS que venías de proponer (mirá tu mensaje anterior en el historial para saber qué producto y cantidad era). NO respondas "listo" con accion "nada": si confirmó, el JSON DEBE llevar "modificar" con los cambios, o el pedido NO se actualiza de verdad.
+- Si el cliente confirma pero no queda claro qué cambio era, preguntá de nuevo qué quiere agregar en vez de inventar."""
 
 
 
@@ -1167,7 +1172,7 @@ Respondé SOLO con este JSON:
 
 
 RUTAS_VALIDAS = ("ASESOR", "PEDIDO", "GESTION", "CONTINUAR", "CHARLA", "AGENTE_HUMANO")
-AGENTES_CONTENIDO = ("asesor", "pedido", "agente_humano")
+AGENTES_CONTENIDO = ("asesor", "pedido", "gestion", "agente_humano")
 
 
 async def _interpretar_desambiguacion(cfg: dict, mensaje: str) -> str:
@@ -1194,6 +1199,8 @@ async def clasificar_ruta(cfg: dict, historial: list, mensaje: str, tarea: str, 
     contexto = ""
     if hay_carrito:
         contexto = "[CONTEXTO: hay un PEDIDO EN CURSO con productos en el carrito. Cualquier pregunta sobre precio, total, resumen o cambios al pedido es PEDIDO, no ASESOR.]"
+    elif tarea == "gestion":
+        contexto = "[CONTEXTO: hay una GESTIÓN DE PEDIDO en curso (el cliente está consultando, modificando o cancelando un pedido ya confirmado, y puede haber una confirmación pendiente). Si el contacto sigue el hilo — confirma ('sí', 'dale'), da más datos, o sigue hablando del mismo pedido — es CONTINUAR.]"
     elif tarea in AGENTES_CONTENIDO:
         contexto = f"[CONTEXTO: hay una tarea de '{tarea}' en curso. Si el contacto sigue el hilo, es CONTINUAR.]"
     contenido = f"{contexto}\nMensaje del contacto: {mensaje}".strip()
@@ -1276,6 +1283,7 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
     carrito = carrito_previo
     pedido_registrado = None
     marca_pedido = None  # (fecha_iso, order_number) si se confirma un pedido en este turno
+    gestion_completada = False  # True cuando gestión ejecutó una acción y cierra el hilo
 
     historial.append({"role": "user", "content": mensaje})
 
@@ -1452,6 +1460,7 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
                 ok = await cpm_cancelar_pedido(tenant_id, oid)
                 if ok:
                     texto = f"Listo, cancelé tu pedido N° {objetivo.get('order_number', num_g)}. Cualquier cosa, acá estoy."
+                    gestion_completada = True
                 else:
                     texto = "No pude cancelarlo desde acá. Te paso con el equipo para que lo resuelvan."
             else:
@@ -1503,6 +1512,7 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
                     ok = await cpm_editar_items(tenant_id, oid, payload)
                     if ok:
                         texto = texto or f"Listo, actualicé tu pedido N° {objetivo.get('order_number', num_g)}."
+                        gestion_completada = True
                         # Si lo agregado vino del carrito en curso, ya pasó al pedido: vaciarlo
                         # para que no quede huérfano ni genere un pedido nuevo.
                         agregados_nuevos = any((c.get("operacion") or "").lower() == "agregar" for c in cambios)
@@ -1534,6 +1544,9 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
     nueva_tarea = agente if agente in AGENTES_CONTENIDO else ""
     # si se registró el pedido, ya no hay tarea de pedido pendiente
     if pedido_registrado:
+        nueva_tarea = ""
+    # si gestión completó su acción (modificó/canceló), cierra el hilo
+    if gestion_completada:
         nueva_tarea = ""
     campos_persist = {
         "historial": historial,
