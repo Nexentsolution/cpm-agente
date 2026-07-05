@@ -173,71 +173,105 @@ async def guardar_log(tenant_id: str, contact_id: str, agente: str, mensaje: str
 # CATÁLOGO (Capa 2)
 # ─────────────────────────────────────────────
 
-# Cache de lista liviana por tenant (nombre+keywords+categoría). Refresca cada CAT_TTL.
+# Cache de catálogo del CPM por tenant. TTL corto porque promos/stock cambian.
 _catalogo_cache = {}
-CAT_TTL = 300
+CAT_TTL = 60
 
 
-async def get_lista_liviana(tenant_id: str) -> list:
-    """Trae catálogo liviano: name, keywords, categoría. Poco texto para inyectar al modelo."""
+async def cpm_get_catalogo(tenant_id: str) -> list:
+    """GET /catalog del CPM — fuente de verdad: precios, stock, promos, fraccionamiento.
+       Los productos con promo activa y cupo vienen primero."""
     ahora = datetime.utcnow().timestamp()
     cacheado = _catalogo_cache.get(tenant_id)
     if cacheado and (ahora - cacheado["ts"]) < CAT_TTL:
         return cacheado["data"]
-
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.get(
-            f"{SUPABASE_URL}/rest/v1/products",
-            headers=_headers(),
-            params={"tenant_id": f"eq.{tenant_id}", "active": "eq.true",
-                    "select": "name,keywords,product_categories(name)"}
-        )
+    try:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+            r = await client.get(
+                f"{CPM_API_URL}/catalog",
+                headers=_headers_cpm(),
+                params={"tenant_id": tenant_id},
+            )
+        if r.status_code != 200:
+            print(f"[cpm_get_catalogo] status={r.status_code} resp={r.text[:200]}")
+            return cacheado["data"] if cacheado else []
         data = r.json()
+        productos = data.get("products", data) if isinstance(data, dict) else data
+        if not isinstance(productos, list):
+            productos = []
+        _catalogo_cache[tenant_id] = {"ts": ahora, "data": productos}
+        return productos
+    except Exception as e:
+        print(f"[cpm_get_catalogo] excepción: {e}")
+        return cacheado["data"] if cacheado else []
+
+
+async def get_lista_liviana(tenant_id: str) -> list:
+    """Catálogo desde el CPM, adaptado al formato liviano que usan los prompts.
+       Ahora incluye precios, promo y fraccionamiento."""
+    productos = await cpm_get_catalogo(tenant_id)
     lista = []
-    if isinstance(data, list):
-        for p in data:
-            cat = ""
-            pc = p.get("product_categories")
-            if isinstance(pc, dict):
-                cat = pc.get("name", "") or ""
-            kws = p.get("keywords") or []
-            lista.append({"name": p.get("name", ""), "keywords": kws, "categoria": cat})
-    _catalogo_cache[tenant_id] = {"ts": ahora, "data": lista}
+    for p in productos:
+        lista.append({
+            "name": p.get("name", ""),
+            "keywords": p.get("keywords") or [],
+            "categoria": p.get("category", "") or "",
+            "precio_bulto": p.get("precio_bulto"),
+            "precio_unidad": p.get("precio_unidad"),
+            "stock_bultos": p.get("stock_disponible_bultos"),
+            "stock_unidades": p.get("stock_disponible_unidades"),
+            "promo": p.get("promo"),
+            "fraccionada": p.get("venta_fraccionada") or {},
+        })
     return lista
 
 
 def formato_lista_liviana(lista: list) -> str:
-    """Texto compacto del catálogo para inyectar al asesor en el paso 1."""
+    """Texto compacto del catálogo con precios, promos y fraccionamiento."""
     if not lista:
         return "(catálogo vacío)"
     lineas = []
     for p in lista:
-        kws = ", ".join(p["keywords"]) if p["keywords"] else ""
-        cat = f" [{p['categoria']}]" if p["categoria"] else ""
-        extra = f" (palabras: {kws})" if kws else ""
-        lineas.append(f"- {p['name']}{cat}{extra}")
+        cat = f" [{p.get('categoria')}]" if p.get("categoria") else ""
+        partes = [f"- {p['name']}{cat}"]
+        pb = p.get("precio_bulto")
+        if pb:
+            partes.append(f"bulto ${pb:,.0f}")
+        promo = p.get("promo")
+        if isinstance(promo, dict) and promo.get("activa") and (promo.get("disponibles_en_promo") or 0) > 0:
+            partes.append(f"🔥 PROMO {promo.get('descuento_pct')}% OFF: ${promo.get('precio_promo'):,.0f} el bulto"
+                          f" (quedan {promo.get('disponibles_en_promo')} en promo)")
+        fr = p.get("fraccionada") or {}
+        pu = p.get("precio_unidad")
+        if fr.get("permite_unidad") and pu:
+            partes.append(f"unidad suelta ${pu:,.0f} ({fr.get('unidades_por_bulto')} un/bulto)")
+        sb = p.get("stock_bultos")
+        if sb is not None:
+            partes.append(f"stock: {sb} bultos")
+        lineas.append(" | ".join(partes))
     return "\n".join(lineas)
 
 
 async def get_categorias_con_destacados(tenant_id: str, por_categoria: int = 3) -> str:
-    """Para consultas amplias: lista categorías con algunos productos destacados de cada una."""
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.get(
-            f"{SUPABASE_URL}/rest/v1/products",
-            headers=_headers(),
-            params={"tenant_id": f"eq.{tenant_id}", "active": "eq.true",
-                    "select": "name,product_categories(name)"}
-        )
-        data = r.json()
-    if not isinstance(data, list) or not data:
+    """Para consultas amplias: categorías con destacados, desde el catálogo del CPM.
+       Las promos activas se destacan al inicio."""
+    productos = await cpm_get_catalogo(tenant_id)
+    if not productos:
         return "(catálogo vacío)"
+    # Promos primero (el CPM ya las ordena al inicio de la lista)
+    promos = []
+    for p in productos:
+        promo = p.get("promo")
+        if isinstance(promo, dict) and promo.get("activa") and (promo.get("disponibles_en_promo") or 0) > 0:
+            promos.append(f"  🔥 {p.get('name')} — {promo.get('descuento_pct')}% OFF: ${promo.get('precio_promo'):,.0f} el bulto")
     # Agrupar por categoría
     cats = {}
-    for p in data:
-        pc = p.get("product_categories")
-        cat = pc.get("name", "Otros") if isinstance(pc, dict) else "Otros"
+    for p in productos:
+        cat = p.get("category") or "Otros"
         cats.setdefault(cat, []).append(p.get("name", ""))
     bloques = []
+    if promos:
+        bloques.append("OFERTAS ACTIVAS (mencionalas de entrada):\n" + "\n".join(promos))
     for cat, prods in cats.items():
         destacados = prods[:por_categoria]
         lista = "\n".join(f"  • {n}" for n in destacados)
@@ -256,10 +290,10 @@ def es_consulta_amplia(mensaje: str) -> bool:
 
 
 async def get_detalle_productos(tenant_id: str, nombres: list) -> list:
-    """Dado nombres exactos de productos, trae su detalle completo con variantes."""
+    """Descripciones editoriales desde Supabase + precios/promos desde el catálogo CPM
+       (una sola fuente de verdad para precios)."""
     if not nombres:
         return []
-    # PostgREST: filtrar por name in (...). Escapamos comillas dobles.
     valores = ",".join('"' + n.replace('"', '') + '"' for n in nombres)
     async with httpx.AsyncClient(timeout=15) as client:
         r = await client.get(
@@ -267,29 +301,29 @@ async def get_detalle_productos(tenant_id: str, nombres: list) -> list:
             headers=_headers(),
             params={"tenant_id": f"eq.{tenant_id}", "active": "eq.true",
                     "name": f"in.({valores})",
-                    "select": "name,ai_description,related_ids,product_variants(name,price,stock,reserved,is_default,active)"}
+                    "select": "name,ai_description"}
         )
         data = r.json()
+    # Precios y promos: del catálogo CPM
+    catalogo = await cpm_get_catalogo(tenant_id)
+    cat_por_nombre = {_norm_nombre(p.get("name", "")): p for p in catalogo}
     detalle = []
     if isinstance(data, list):
         for p in data:
-            variantes = []
-            for v in (p.get("product_variants") or []):
-                if not v.get("active", True):
-                    continue
-                stock = v.get("stock") or 0
-                reserved = v.get("reserved") or 0
-                disponible = max(0, stock - reserved)
-                variantes.append({
-                    "variante": v.get("name", "Estándar"),
-                    "precio": v.get("price"),
-                    "disponible": disponible,
-                    "is_default": v.get("is_default", False),
-                })
+            nombre = p.get("name", "")
+            cpm_p = cat_por_nombre.get(_norm_nombre(nombre), {})
+            promo = cpm_p.get("promo")
+            promo_ok = isinstance(promo, dict) and promo.get("activa") and (promo.get("disponibles_en_promo") or 0) > 0
+            fr = cpm_p.get("venta_fraccionada") or {}
             detalle.append({
-                "name": p.get("name", ""),
+                "name": nombre,
                 "ai_description": p.get("ai_description", "") or "",
-                "variantes": variantes,
+                "precio_bulto": cpm_p.get("precio_bulto"),
+                "precio_unidad": cpm_p.get("precio_unidad") if fr.get("permite_unidad") else None,
+                "stock_bultos": cpm_p.get("stock_disponible_bultos"),
+                "promo": {"descuento_pct": promo.get("descuento_pct"),
+                          "precio_promo": promo.get("precio_promo"),
+                          "disponibles": promo.get("disponibles_en_promo")} if promo_ok else None,
             })
     return detalle
 
@@ -300,13 +334,20 @@ def formato_detalle(detalle: list) -> str:
         return "(no se encontraron esos productos)"
     bloques = []
     for p in detalle:
-        vs = []
-        for v in p["variantes"]:
-            disp = "SÍ hay stock" if v["disponible"] > 0 else "SIN stock"
-            precio = f"${v['precio']}" if v["precio"] is not None else "precio no disponible"
-            vs.append(f"  · {v['variante']}: {precio} — {disp} (disponibles: {v['disponible']})")
-        vtxt = "\n".join(vs) if vs else "  (sin variantes activas)"
-        bloques.append(f"PRODUCTO: {p['name']}\nDescripción: {p['ai_description']}\n{vtxt}")
+        lineas = [f"PRODUCTO: {p['name']}", f"Descripción: {p['ai_description']}"]
+        pb = p.get("precio_bulto")
+        sb = p.get("stock_bultos")
+        if pb:
+            stock_txt = f" — stock: {sb} bultos" if sb is not None else ""
+            lineas.append(f"  · Bulto: ${pb:,.0f}{stock_txt}")
+        promo = p.get("promo")
+        if promo:
+            lineas.append(f"  · 🔥 EN PROMO: {promo['descuento_pct']}% OFF → ${promo['precio_promo']:,.0f} el bulto "
+                          f"(quedan {promo['disponibles']} en promo). OFRECELA de entrada.")
+        pu = p.get("precio_unidad")
+        if pu:
+            lineas.append(f"  · Unidad suelta: ${pu:,.0f} (también se vende fraccionado)")
+        bloques.append("\n".join(lineas))
     return "\n\n".join(bloques)
 
 
@@ -481,12 +522,18 @@ Devolvé SOLO el texto al cliente. Sin JSON, sin markdown."""
 def prompt_pedido(cfg: dict, lista_txt: str, carrito_txt: str) -> str:
     return f"""{_ctx_tenant(cfg)}
 
-Tu rol ahora: TOMAR EL PEDIDO. Se vende por bulto entero. Atendé con naturalidad e incitá sutilmente a sumar productos (en vez de "¿con eso estaría?", preguntá "¿qué más te llevás?").
+Tu rol ahora: TOMAR EL PEDIDO. Atendé con naturalidad e incitá sutilmente a sumar productos (en vez de "¿con eso estaría?", preguntá "¿qué más te llevás?").
+
+PROMOS Y VENTA FRACCIONADA (NUEVO — leer con atención):
+- El catálogo de abajo marca las PROMOS activas (🔥). OFRECELAS ESPONTÁNEAMENTE: al mencionar o sugerir un producto en promo, decí el descuento y el precio promo ("está con 20% off, te queda a $67.200 el bulto en vez de $84.000"). Si el cliente lo agrega, confirmá mencionando el descuento. Si quedan pocas en promo, podés usar urgencia real. NUNCA calcules descuentos vos: usá el % y el precio tal como figuran.
+- La promo aplica SOLO comprando el bulto, nunca por unidad suelta.
+- Algunos productos se venden también POR UNIDAD SUELTA (figura "unidad suelta $X" en el catálogo). Si el cliente pide poca cantidad o duda, ofrecé las dos opciones ("por unidad a $7.778 o el bulto de 12 a $84.000, que conviene más"). Si el cliente pide "un [producto]" y ese producto es fraccionable, ACLARÁ si quiere unidad o bulto antes de agregar. Si NO es fraccionable, se vende solo por bulto: no ofrezcas unidad y si la piden, aclaralo amablemente.
+- Upsell: si pide varias unidades sueltas y le conviene el bulto, sugerilo con los números reales.
 
 CÓMO TRABAJÁS:
 - Identificá qué productos quiere agregar el cliente, usando los nombres EXACTOS del catálogo de abajo.
 - Si el cliente nombra un producto que podés identificar sin ambigüedad en el catálogo (aunque no esté escrito idéntico, ej. "limpiador de piso marina 150ml" → "Bulto Limpiador de Pisos Smart Marina 150ml"), AGREGALO DIRECTO con accion "agregar". NO preguntes de más ni muestres el pedido sin actualizarlo. Si no aclara cantidad, asumí 1 bulto y aclaralo en el texto.
-- Preguntá SOLO si hay ambigüedad REAL que te impide elegir el producto: falta la fragancia entre varias opciones, o falta el formato/ml y hay varios. Si el cliente ya dio esos datos, no vuelvas a preguntar.
+- Preguntá SOLO si hay ambigüedad REAL que te impide elegir el producto: falta la fragancia entre varias opciones, falta el formato/ml y hay varios, o el producto es fraccionable y no sabés si quiere unidad o bulto. Si el cliente ya dio esos datos, no vuelvas a preguntar.
 - NO agregues un producto que ya está en el carrito de nuevo. Si el cliente corrige la cantidad ("quería 1, no 2"), usá accion "reemplazar" para fijar la cantidad correcta, no "agregar".
 - REGLA DE ORO ANTI-DUPLICADO: mirá el CARRITO ACTUAL de abajo. Si un producto YA figura ahí con la cantidad que el cliente quiere, NO lo vuelvas a incluir en "items" con accion "agregar". Solo usá "agregar" para productos NUEVOS o para CANTIDAD ADICIONAL que el cliente pide explícitamente ("sumale 2 más"). Repetir un "agregar" con lo que ya está DUPLICA el pedido y es un error grave.
 - Cuando el cliente solo REAFIRMA o ACEPTA ("sí", "dale", "confirmo", "correcto", "está bien") SIN nombrar productos ni cantidades nuevas, NUNCA es "agregar". Es "confirmar" (si venías pidiendo confirmación del pedido) o "nada" (si respondía otra cosa). JAMÁS devuelvas "agregar" con los mismos productos del carrito solo porque el cliente dijo "dale".
@@ -510,7 +557,7 @@ CARRITO ACTUAL (con precios, solo para tu referencia — NO lo copies en el text
 
 Respondé SIEMPRE con texto al cliente + este JSON al final (el cliente NO ve el JSON):
 ---JSON---
-{{"accion": "agregar|reemplazar|nada|confirmar", "items": [{{"producto": "Nombre exacto del catálogo", "cantidad": 1}}]}}
+{{"accion": "agregar|reemplazar|nada|confirmar", "items": [{{"producto": "Nombre exacto del catálogo", "cantidad": 1, "unidad": "bulto"}}]}}
 ---FIN---
 
 REGLAS DEL JSON (CRÍTICO):
@@ -521,7 +568,8 @@ REGLAS DEL JSON (CRÍTICO):
 - accion "resumen": cuando el cliente pide VER el pedido/resumen/cotización sin cambiar nada ("pasame el resumen", "cómo queda", "cuánto es el total", "mostrame el pedido").
 - accion "nada": SOLO cuando de verdad no cambiás el carrito y no piden ver el resumen (una duda puntual, un saludo).
 - accion "confirmar": SOLO ante confirmación explícita del cliente.
-- La cantidad es en bultos. Usá SIEMPRE el nombre exacto del catálogo."""
+- "unidad": "bulto" (default) o "unidad" si el cliente elige comprar unidades sueltas de un producto fraccionable. La cantidad entonces es en UNIDADES, no bultos.
+- Usá SIEMPRE el nombre exacto del catálogo."""
 
 
 def prompt_gestion(cfg: dict, pedidos_txt: str, lista_txt: str) -> str:
@@ -534,6 +582,8 @@ PEDIDOS DEL CLIENTE (datos reales del sistema — son la VERDAD, no inventes nad
 
 CATÁLOGO (nombres exactos — usalos TAL CUAL para agregar productos nuevos):
 {lista_txt}
+
+PROMOS (importante): si un producto del catálogo figura con 🔥 PROMO y el cliente lo agrega, mencioná el descuento ("está con 20% off"). La promo aplica SOLO por bulto. Si el cliente aumenta la cantidad de un renglón que ya está [EN PROMO], puede fallar por cupo — si el sistema lo rechaza, avisá cuántas quedan y ofrecé el resto a precio normal.
 
 ESTADOS Y CÓMO NOMBRARLOS AL CLIENTE (NUNCA escribas el nombre técnico con guión bajo, usá la versión natural):
 - pendiente → "pendiente, todavía no lo empezó a preparar el local"
@@ -596,36 +646,42 @@ CONTACTO_PRUEBA = "4799b595-5388-4002-8ba8-b9a82624a802"
 
 
 async def buscar_producto_para_pedido(tenant_id: str, nombres: list) -> list:
-    """Trae producto + variante default (precio, stock, reserved, ids) para los nombres dados."""
+    """Busca productos en el catálogo del CPM (fuente de verdad) por nombre, con match robusto.
+       Devuelve ids, ambos precios, stocks, promo y fraccionamiento."""
     if not nombres:
         return []
-    valores = ",".join('"' + n.replace('"', '') + '"' for n in nombres)
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.get(
-            f"{SUPABASE_URL}/rest/v1/products",
-            headers=_headers(),
-            params={"tenant_id": f"eq.{tenant_id}", "active": "eq.true",
-                    "name": f"in.({valores})",
-                    "select": "id,name,product_variants(id,name,price,stock,reserved,is_default,active)"}
-        )
-        data = r.json()
+    catalogo = await cpm_get_catalogo(tenant_id)
     out = []
-    if isinstance(data, list):
-        for p in data:
-            variantes = [v for v in (p.get("product_variants") or []) if v.get("active", True)]
-            # variante default o la primera
-            v = next((x for x in variantes if x.get("is_default")), variantes[0] if variantes else None)
-            if not v:
-                continue
-            stock = v.get("stock") or 0
-            reserved = v.get("reserved") or 0
-            out.append({
-                "product_id": p["id"],
-                "product_name": p["name"],
-                "variant_id": v["id"],
-                "precio": float(v.get("price") or 0),
-                "disponible": max(0, stock - reserved),
-            })
+    for nombre in nombres:
+        obj = _norm_nombre(nombre)
+        # match exacto normalizado, después por contención
+        prod = next((p for p in catalogo if _norm_nombre(p.get("name", "")) == obj), None)
+        if not prod:
+            prod = next((p for p in catalogo
+                         if obj and (obj in _norm_nombre(p.get("name", "")) or _norm_nombre(p.get("name", "")) in obj)), None)
+        if not prod:
+            continue
+        promo = prod.get("promo")
+        promo_ok = isinstance(promo, dict) and promo.get("activa") and (promo.get("disponibles_en_promo") or 0) > 0
+        fr = prod.get("venta_fraccionada") or {}
+        out.append({
+            "product_id": prod.get("product_id"),
+            "product_name": prod.get("name", ""),
+            "variant_id": prod.get("variant_id"),
+            # compat: "precio" y "disponible" siguen siendo los de bulto (lo que usaba el código previo)
+            "precio": float(prod.get("precio_bulto") or 0),
+            "disponible": int(prod.get("stock_disponible_bultos") or 0),
+            # nuevos campos
+            "precio_bulto": float(prod.get("precio_bulto") or 0),
+            "precio_unidad": float(prod.get("precio_unidad") or 0) if prod.get("precio_unidad") else None,
+            "stock_unidades": prod.get("stock_disponible_unidades"),
+            "permite_unidad": bool(fr.get("permite_unidad")),
+            "unidades_por_bulto": fr.get("unidades_por_bulto"),
+            "promo_activa": bool(promo_ok),
+            "precio_promo": float(promo.get("precio_promo") or 0) if promo_ok else None,
+            "descuento_pct": promo.get("descuento_pct") if promo_ok else None,
+            "disponibles_en_promo": promo.get("disponibles_en_promo") if promo_ok else 0,
+        })
     return out
 
 
@@ -823,8 +879,13 @@ def _items_cpm_a_imagen(items_cpm: list) -> list:
         cant = int(it.get("quantity", it.get("cantidad", 0)) or 0)
         if cant <= 0:
             continue  # ítems borrados (quantity 0) no van en la imagen
+        nombre = it.get("product_name", it.get("producto", "Producto"))
+        if (it.get("sale_unit") or "bulto") == "unidad" and "(unidad" not in nombre.lower():
+            nombre += " (unidad)"
+        if it.get("is_promo"):
+            nombre += " 🔥PROMO"
         out.append({
-            "product_name": it.get("product_name", it.get("producto", "Producto")),
+            "product_name": nombre,
             "cantidad": cant,
             "precio": float(it.get("unit_price", it.get("precio", 0)) or 0),
         })
@@ -900,7 +961,13 @@ def formato_pedidos_gestion(pedidos: list) -> str:
             precio = float(it.get("unit_price", it.get("precio", 0)) or 0)
             subtotal = precio * cant
             total_calc += subtotal
-            partes.append(f"{cant}x {nombre} (${precio:,.0f} c/u = ${subtotal:,.0f})")
+            etiquetas = []
+            if (it.get("sale_unit") or "bulto") == "unidad":
+                etiquetas.append("unidad suelta")
+            if it.get("is_promo"):
+                etiquetas.append("EN PROMO")
+            etq = f" [{', '.join(etiquetas)}]" if etiquetas else ""
+            partes.append(f"{cant}x {nombre}{etq} (${precio:,.0f} c/u = ${subtotal:,.0f})")
         items_txt = "; ".join(partes) or "(sin detalle de ítems)"
         # total: usar el del CPM si viene, si no el calculado
         total = p.get("total")
@@ -916,14 +983,23 @@ def formato_pedidos_gestion(pedidos: list) -> str:
 
 
 async def cpm_crear_pedido(tenant_id: str, manychat_contact_id: str, items: list) -> dict:
-    """POST /orders — crea el pedido en estado pendiente. Devuelve {ok, order_id, order_number}."""
-    payload_items = [{
-        "variant_id": it["variant_id"],
-        "product_id": it["product_id"],
-        "product_name": it["product_name"],
-        "quantity": it["cantidad"],
-        "unit_price": it["precio"],
-    } for it in items]
+    """POST /orders — crea el pedido en estado pendiente. Devuelve {ok, order_id, order_number}.
+       Si el CPM rechaza (400 con mensaje: sin cupo promo, sin stock, etc.), devuelve {ok:False, error}."""
+    payload_items = []
+    for it in items:
+        item = {
+            "variant_id": it["variant_id"],
+            "product_id": it["product_id"],
+            "product_name": it["product_name"],
+            "quantity": it["cantidad"],
+            "unit_price": it["precio"],
+        }
+        if it.get("sale_unit") and it["sale_unit"] != "bulto":
+            item["sale_unit"] = it["sale_unit"]
+        if it.get("is_promo"):
+            item["sale_unit"] = it.get("sale_unit", "bulto")
+            item["is_promo"] = True
+        payload_items.append(item)
     try:
         async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
             r = await client.post(
@@ -933,12 +1009,17 @@ async def cpm_crear_pedido(tenant_id: str, manychat_contact_id: str, items: list
             )
         if r.status_code not in (200, 201):
             print(f"[cpm_crear_pedido] status={r.status_code} resp={r.text[:200]}")
-            return {"ok": False}
+            err = ""
+            try:
+                err = (r.json() or {}).get("error", "")
+            except Exception:
+                pass
+            return {"ok": False, "error": err}
         data = r.json()
         return {"ok": True, "order_id": data.get("order_id"), "order_number": data.get("order_number")}
     except Exception as e:
         print(f"[cpm_crear_pedido] excepción: {e}")
-        return {"ok": False}
+        return {"ok": False, "error": ""}
 
 
 async def cpm_consultar_pedidos_cliente(tenant_id: str, manychat_contact_id: str) -> list:
@@ -1015,10 +1096,11 @@ async def cpm_cambiar_estado(tenant_id: str, order_id: str, status: str) -> bool
         return False
 
 
-async def cpm_editar_items(tenant_id: str, order_id: str, items: list) -> bool:
+async def cpm_editar_items(tenant_id: str, order_id: str, items: list) -> dict:
     """PATCH /orders/{id}/items — incremental. items acepta:
        {id, quantity} para cambiar cantidad, {id, quantity:0} para quitar,
-       {variant_id, product_id, product_name, quantity, unit_price} para agregar nuevo."""
+       {variant_id, product_id, product_name, quantity, unit_price, sale_unit?, is_promo?} para agregar.
+       Devuelve {ok: bool, error: str} — error trae el mensaje de negocio del CPM (400)."""
     try:
         async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
             r = await client.patch(
@@ -1028,11 +1110,16 @@ async def cpm_editar_items(tenant_id: str, order_id: str, items: list) -> bool:
             )
         if r.status_code not in (200, 204):
             print(f"[cpm_editar_items] status={r.status_code} resp={r.text[:200]}")
-            return False
-        return True
+            err = ""
+            try:
+                err = (r.json() or {}).get("error", "")
+            except Exception:
+                pass
+            return {"ok": False, "error": err}
+        return {"ok": True, "error": ""}
     except Exception as e:
         print(f"[cpm_editar_items] excepción: {e}")
-        return False
+        return {"ok": False, "error": ""}
 
 
 async def cpm_cancelar_pedido(tenant_id: str, order_id: str) -> bool:
@@ -1315,14 +1402,16 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
         agente = "pedido"
 
     # Red de seguridad de GESTIÓN: si venías gestionando un pedido confirmado y el router
-    # te manda a pedido/asesor SIN señal clara de "pedido nuevo", mantené gestión.
-    # Esto evita que "agregá un combo" (sobre el pedido gestionado) salte a armar un carrito nuevo.
-    if tarea == "gestion" and agente in ("pedido", "asesor"):
+    # te manda a pedido/asesor/charla SIN señal clara de "pedido nuevo" o cierre, mantené gestión.
+    # Evita que "agregá un combo" o una cortesía ("perfecto") saquen del hilo de gestión.
+    if tarea == "gestion" and agente in ("pedido", "asesor", "charla"):
         m_low = (mensaje or "").lower()
-        señal_pedido_nuevo = any(k in m_low for k in [
+        sale_de_gestion = any(k in m_low for k in [
             "pedido nuevo", "otro pedido", "nuevo pedido", "empezar de cero",
-            "arrancar otro", "aparte", "por separado", "distinto pedido"])
-        if not señal_pedido_nuevo:
+            "arrancar otro", "aparte", "por separado", "distinto pedido",
+            "chau", "nada mas", "nada más", "eso es todo", "listo gracias"])
+        # cortesías puras ("perfecto", "gracias", "ok") NO sacan de gestión: se quedan
+        if not sale_de_gestion:
             print(f"[DIAG-GESTION] router dijo '{agente}' pero mantengo GESTION (venía gestionando)")
             agente = "gestion"
 
@@ -1410,6 +1499,7 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
             items_ped = jd_ped.get("items") or []
             nombres = [it.get("producto", "") for it in items_ped]
             cants = {it.get("producto", ""): int(it.get("cantidad", 1) or 1) for it in items_ped}
+            unidades = {it.get("producto", ""): (it.get("unidad") or "bulto").lower() for it in items_ped}
             encontrados = await buscar_producto_para_pedido(tenant_id, nombres)
 
             # ANTI-DUPLICADO (idempotencia): el modelo suele re-emitir el MISMO
@@ -1418,11 +1508,12 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
             # ya están en el carrito con cantidad >= a la pedida, es un re-envío,
             # no una intención real de sumar más: lo tratamos como no-op.
             if accion == "agregar" and encontrados:
-                def _cant_en_carrito(pid):
-                    it = next((c for c in carrito if c["product_id"] == pid), None)
+                def _cant_en_carrito(pid, su):
+                    it = next((c for c in carrito if c["product_id"] == pid
+                               and c.get("sale_unit", "bulto") == su), None)
                     return it["cantidad"] if it else 0
                 es_reenvio = all(
-                    _cant_en_carrito(prod["product_id"]) >= cants.get(prod["product_name"], 1)
+                    _cant_en_carrito(prod["product_id"], unidades.get(prod["product_name"], "bulto")) >= cants.get(prod["product_name"], 1)
                     for prod in encontrados
                 )
                 if es_reenvio:
@@ -1435,25 +1526,52 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
             avisos = []
             for prod in encontrados:
                 pedido_cant = cants.get(prod["product_name"], 1)
-                if prod["disponible"] <= 0:
-                    avisos.append(f"⚠️ {prod['product_name']}: sin stock, no lo pude agregar.")
+                su = unidades.get(prod["product_name"], "bulto")
+                # Venta por unidad: validar que el producto lo permita y el stock alcance
+                if su == "unidad":
+                    if not prod.get("permite_unidad") or not prod.get("precio_unidad"):
+                        avisos.append(f"⚠️ {prod['product_name']}: solo se vende por bulto, lo dejé como bulto.")
+                        su = "bulto"
+                    elif prod.get("stock_unidades") is not None and pedido_cant > prod["stock_unidades"]:
+                        avisos.append(f"⚠️ {prod['product_name']}: solo hay {prod['stock_unidades']} unidades sueltas, ajusté.")
+                        pedido_cant = prod["stock_unidades"]
+                if su == "bulto":
+                    if prod["disponible"] <= 0:
+                        avisos.append(f"⚠️ {prod['product_name']}: sin stock, no lo pude agregar.")
+                        continue
+                    if pedido_cant > prod["disponible"]:
+                        avisos.append(f"⚠️ {prod['product_name']}: solo hay {prod['disponible']} disponibles, ajusté la cantidad.")
+                        pedido_cant = prod["disponible"]
+                if pedido_cant <= 0:
                     continue
-                if pedido_cant > prod["disponible"]:
-                    avisos.append(f"⚠️ {prod['product_name']}: solo hay {prod['disponible']} disponibles, ajusté la cantidad.")
-                    pedido_cant = prod["disponible"]
-                existente = next((c for c in carrito if c["product_id"] == prod["product_id"]), None)
+                # Precio según cómo compra: promo (solo bulto) > bulto > unidad
+                is_promo = False
+                if su == "unidad":
+                    precio = prod["precio_unidad"]
+                elif prod.get("promo_activa") and (prod.get("disponibles_en_promo") or 0) >= pedido_cant:
+                    precio = prod["precio_promo"]
+                    is_promo = True
+                else:
+                    precio = prod["precio_bulto"]
+                existente = next((c for c in carrito if c["product_id"] == prod["product_id"]
+                                  and c.get("sale_unit", "bulto") == su), None)
                 if existente:
                     if accion == "reemplazar":
                         existente["cantidad"] = pedido_cant
                     else:
                         existente["cantidad"] += pedido_cant
+                    existente["precio"] = precio
+                    existente["is_promo"] = is_promo
                 else:
+                    nombre_mostrar = prod["product_name"] + (" (unidad)" if su == "unidad" else "")
                     carrito.append({
                         "product_id": prod["product_id"],
-                        "product_name": prod["product_name"],
+                        "product_name": nombre_mostrar,
                         "variant_id": prod["variant_id"],
-                        "precio": prod["precio"],
+                        "precio": precio,
                         "cantidad": pedido_cant,
+                        "sale_unit": su,
+                        "is_promo": is_promo,
                     })
             texto = texto_tmp
             if avisos:
@@ -1472,16 +1590,21 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
                              f"Total: ${total:,.0f}. En breve el equipo lo confirma. ¡Gracias!")
                     # Marca local para desambiguar futuros pedidos del día (sin consultar CPM)
                     marca_pedido = (datetime.utcnow().date().isoformat(), str(num))
+                    pedido_registrado = res
+                    carrito = []
+                elif res.get("error"):
+                    # Error de NEGOCIO del CPM (sin cupo de promo, sin stock, no fraccionable):
+                    # comunicarlo y MANTENER el carrito para que el cliente ajuste y reintente.
+                    print(f"[cpm_crear_pedido] rechazo de negocio: {res['error']}")
+                    texto = (f"No pude registrar el pedido: {res['error']} "
+                             f"¿Querés ajustar la cantidad o cambiar algo y lo intentamos de nuevo?")
                 else:
-                    # El CPM falló, pero NO dejamos el carrito acumulándose entre sesiones.
-                    # Se vacía igual; el cliente puede rearmar el pedido si hace falta.
-                    print(f"[cpm_crear_pedido] FALLÓ al confirmar — carrito se vacía igual para no acumular. total=${total:,.0f}")
+                    # Fallo técnico (sin mensaje): no acumular basura entre sesiones.
+                    print(f"[cpm_crear_pedido] FALLÓ al confirmar (técnico) — carrito se vacía para no acumular. total=${total:,.0f}")
                     texto = ("Tomé tu pedido y lo estoy registrando. Si en un rato no te llega la confirmación, "
                              "escribinos y lo revisamos. ¡Gracias!")
-                # En ambos casos: el pedido se dio por cerrado. Vaciamos el carrito y
-                # marcamos pedido_registrado para que NO se genere imagen ni quede tarea pendiente.
-                pedido_registrado = res if res.get("ok") else {"ok": False, "cerrado": True}
-                carrito = []
+                    pedido_registrado = {"ok": False, "cerrado": True}
+                    carrito = []
         else:
             texto = texto_tmp
 
@@ -1594,19 +1717,26 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
                             prod = cat_por_nombre.get(nombre.lower()) or next(
                                 (p for p in catalogo_nuevos if _norm_nombre(p["product_name"]) == _norm_nombre(nombre)), None)
                             if prod and prod.get("disponible", 0) > 0:
-                                payload.append({
+                                # Precio según promo (la promo aplica solo por bulto)
+                                is_promo = bool(prod.get("promo_activa") and (prod.get("disponibles_en_promo") or 0) >= cant)
+                                precio = prod["precio_promo"] if is_promo else prod["precio_bulto"]
+                                item_nuevo = {
                                     "variant_id": prod["variant_id"],
                                     "product_id": prod["product_id"],
                                     "product_name": prod["product_name"],
                                     "quantity": cant,
-                                    "unit_price": prod["precio"],
-                                })
+                                    "unit_price": precio,
+                                }
+                                if is_promo:
+                                    item_nuevo["sale_unit"] = "bulto"
+                                    item_nuevo["is_promo"] = True
+                                payload.append(item_nuevo)
                             else:
                                 no_encontrados.append(nombre)
                 print(f"[DIAG-GESTION] modificar payload={payload} | no_encontrados={no_encontrados}")
                 if payload:
-                    ok = await cpm_editar_items(tenant_id, oid, payload)
-                    if ok:
+                    res_edit = await cpm_editar_items(tenant_id, oid, payload)
+                    if res_edit.get("ok"):
                         texto = texto or f"Listo, actualicé tu pedido N° {objetivo.get('order_number', num_g)}."
                         gestion_completada = True
                         # Si lo agregado vino del carrito en curso, ya pasó al pedido: vaciarlo
@@ -1634,7 +1764,13 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
                             imagen_url = await generar_imagen_pedido(tenant_id, cfg, items_img)
                             print(f"[DIAG-GESTION] imagen actualizada='{imagen_url}' | total={total_act}")
                     else:
-                        texto = "No pude aplicar el cambio desde acá. Te paso con el equipo."
+                        if res_edit.get("error"):
+                            # Error de NEGOCIO (sin cupo de promo, no fraccionable, sin stock):
+                            # comunicarlo tal cual y ofrecer alternativa.
+                            texto = (f"No pude aplicar el cambio: {res_edit['error']} "
+                                     f"¿Querés ajustar la cantidad o probamos otra cosa?")
+                        else:
+                            texto = "No pude aplicar el cambio desde acá. Te paso con el equipo."
                 elif no_encontrados:
                     # No se pudo mapear ningún cambio: NO digas "listo" en falso.
                     prods = ", ".join(no_encontrados)
@@ -1664,9 +1800,16 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
     # si se registró el pedido, ya no hay tarea de pedido pendiente
     if pedido_registrado:
         nueva_tarea = ""
-    # si gestión completó su acción (modificó/canceló), cierra el hilo
-    if gestion_completada:
-        nueva_tarea = ""
+    # GESTIÓN es "pegajosa": mientras el cliente siga sobre el mismo pedido, se mantiene.
+    # No la cerramos por completar una modificación (el cliente suele seguir editando),
+    # ni por una cortesía intermedia ("perfecto", "gracias") que cae en charla/asesor.
+    # Solo se cierra si el cliente arranca algo nuevo explícito o confirma cierre.
+    if tarea == "gestion" and agente in ("gestion", "charla", "asesor"):
+        m_low = (mensaje or "").lower()
+        cierra_gestion = any(k in m_low for k in [
+            "pedido nuevo", "otro pedido", "nuevo pedido", "chau", "nada mas", "nada más",
+            "listo gracias", "eso es todo", "gracias nada", "no gracias"])
+        nueva_tarea = "" if cierra_gestion else "gestion"
     campos_persist = {
         "historial": historial,
         "agente_activo": agente,
@@ -1700,7 +1843,7 @@ def _respuesta_unificada(agente, texto, json_data, transcripcion="", imagen_pedi
 
 @app.get("/")
 async def health():
-    return {"status": "CPM activo — multi-tenant + catálogo + pedidos + imágenes + resumen visual + CPM orders (fix 307/idempotencia/no-acumular)"}
+    return {"status": "CPM activo — catálogo en vivo CPM + promos + venta fraccionada + gestión de pedidos + imágenes"}
 
 
 @app.post("/orquestador")
