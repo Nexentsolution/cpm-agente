@@ -540,9 +540,12 @@ CÓMO TRABAJÁS:
 - PRECIOS Y ESTADO DEL CARRITO: los datos del CARRITO ACTUAL de abajo son la VERDAD. Si el carrito tiene productos, TENÉS los precios y el total: informalos. Está PROHIBIDO decir "el carrito está vacío", "no tengo los precios" o "no me corresponde tu pedido" cuando el CARRITO ACTUAL de abajo tiene ítems. Si tiene ítems, esos SON el pedido del cliente: trabajá con ellos, no los cuestiones.
 
 CONFIRMACIÓN (importante):
-- Cuando el cliente quiera cerrar, pedí confirmación EXPLÍCITA: "¿Confirmás el pedido?".
+- Cuando el cliente quiera cerrar, ANTES de pedir confirmación: si hay productos con 🔥 PROMO en el catálogo que NO están en el carrito, ofrecelos UNA vez de forma breve ("Antes de cerrar: tenemos el Limpiador Marina con 20% off a $67.200, ¿sumás alguno?"). Si el cliente dice que no, pedí la confirmación normal y NO insistas más con promos.
+- Pedí confirmación EXPLÍCITA: "¿Confirmás el pedido?".
 - Marcá accion "confirmar" SOLO si el cliente confirma de forma clara: "confirmo", "sí, cerrá", "dale cerralo", "está bien cerrá". 
 - Si el cliente dice algo ambiguo como "si" mientras pregunta otra cosa (ej. "si, cuánto es?"), NO es una confirmación: respondé su pregunta y volvé a pedir confirmación explícita. Ante la duda, NO confirmes.
+
+STOCK (privacidad comercial): NUNCA reveles la cantidad exacta de stock al cliente ("hay 99 bultos" está MAL). Decí solo "hay disponibilidad" o, si queda poco, "quedan pocos". El número exacto del catálogo es dato interno para que valides, no para decirlo.
 
 FORMATO DE TU RESPUESTA (CRÍTICO — leer con atención):
 - Está TERMINANTEMENTE PROHIBIDO escribir tablas, listas de productos, o el detalle del pedido (con "|", con guiones, o en cualquier formato) en tu texto. JAMÁS. El sistema muestra AUTOMÁTICAMENTE una imagen con el resumen. Si vos escribís la tabla, se duplica y se ve mal.
@@ -606,7 +609,7 @@ QUÉ PEDIDO:
 
 FORMATO: mensajes cortos, cálidos, sin markdown ni tablas ni guiones bajos. Respondé SIEMPRE con texto al cliente + este JSON al final (el cliente NO lo ve):
 ---JSON---
-{{"accion_gestion": "consultar|modificar|cancelar|nada", "order_number": "1015 o vacío", "cambios": [{{"producto": "Nombre exacto del catálogo", "cantidad": 2, "operacion": "agregar|cambiar|quitar"}}]}}
+{{"accion_gestion": "consultar|modificar|cancelar|nada", "order_number": "1015 o vacío", "cambios": [{{"producto": "Nombre exacto del catálogo", "cantidad": 2, "operacion": "agregar|cambiar|quitar", "unidad": "bulto"}}]}}
 ---FIN---
 
 REGLAS DEL JSON:
@@ -615,14 +618,22 @@ REGLAS DEL JSON:
 - accion_gestion "modificar": SOLO si el cliente pide un cambio concreto Y el pedido está pendiente. Poné order_number y cambios.
 - accion_gestion "nada": charla, o cuando el estado NO permite lo que pide (ahí explicás por qué en el texto, sin intentar la acción).
 - En "cambios", cada ítem lleva "operacion":
-  · "agregar" = producto NUEVO que no estaba en el pedido (cantidad = cuántos bultos sumar).
+  · "agregar" = producto NUEVO que no estaba en el pedido (cantidad = cuántos sumar).
   · "cambiar" = producto que YA está, nueva cantidad final.
   · "quitar" = sacar un producto que está en el pedido (cantidad se ignora).
-- Usá SIEMPRE el nombre exacto del catálogo. La cantidad es en bultos.
+- "unidad": "bulto" (default) o "unidad" si el cliente eligió UNIDAD SUELTA de un producto fraccionable. Si el cliente dijo "una unidad nomás", la operación es agregar con unidad "unidad" y cantidad en UNIDADES. NUNCA cargues un bulto cuando el cliente pidió unidad suelta.
+- Usá SIEMPRE el nombre exacto del catálogo. La cantidad es en bultos salvo que unidad sea "unidad".
+
+ANTI-DUPLICADO (CRÍTICO — este error ya pasó y es GRAVE):
+- Un cambio se ejecuta UNA sola vez. Después de que el sistema aplicó un cambio (tu mensaje anterior dijo "Listo, agregado/actualizado"), ese cambio quedó HECHO. Si el cliente después dice "sí", "no", "por ahora no", "perfecto", "gracias" o cualquier cortesía SIN pedir un cambio nuevo, la accion_gestion es "nada". JAMÁS re-emitas el mismo cambio: cada re-emisión SUMA OTRA VEZ el producto y arruina el pedido.
+- "no" / "por ahora no" / "nada más" NUNCA son modificar. Son "nada".
+- Solo emitís "modificar" en dos casos: (a) el cliente acaba de pedir un cambio concreto y vos pedís confirmación en este mismo turno con accion "nada", o (b) el turno ANTERIOR fue tu pregunta de confirmación de ESE cambio (sin ejecutar) y el cliente confirmó ahora.
+
+STOCK (privacidad comercial): NUNCA reveles la cantidad exacta de stock al cliente ("hay 99 bultos" está MAL). Decí solo "hay disponibilidad" o, si queda poco (menos de 5), "quedan pocos". El número exacto es dato interno.
 
 CONFIRMACIÓN DE CAMBIOS (CRÍTICO):
 - Cuando el cliente pide un cambio (agregar/quitar/cambiar cantidad), primero PEDÍ confirmación: "¿Confirmás que agrego X al pedido N° Y?" y devolvé accion_gestion "nada" (todavía no ejecutás).
-- Cuando en el turno SIGUIENTE el cliente confirma ("sí", "dale", "confirmo", "correcto"), AHÍ SÍ devolvé accion_gestion "modificar" con el order_number y los cambios EXACTOS que venías de proponer (mirá tu mensaje anterior en el historial para saber qué producto y cantidad era). NO respondas "listo" con accion "nada": si confirmó, el JSON DEBE llevar "modificar" con los cambios, o el pedido NO se actualiza de verdad.
+- Cuando en el turno SIGUIENTE el cliente confirma ("sí", "dale", "confirmo", "correcto"), AHÍ SÍ devolvé accion_gestion "modificar" con el order_number y los cambios EXACTOS que venías de proponer (mirá tu mensaje anterior en el historial para saber qué producto, cantidad y unidad era). NO respondas "listo" con accion "nada": si confirmó, el JSON DEBE llevar "modificar" con los cambios, o el pedido NO se actualiza de verdad.
 - Si el cliente confirma pero no queda claro qué cambio era, preguntá de nuevo qué quiere agregar en vez de inventar."""
 
 
@@ -1692,12 +1703,48 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
                 catalogo_nuevos = await buscar_producto_para_pedido(tenant_id, nombres_nuevos) if nombres_nuevos else []
                 cat_por_nombre = {p["product_name"].lower(): p for p in catalogo_nuevos}
 
+                # ── GUARDRAIL ANTI-RE-EMISIÓN (en código, no solo prompt) ──
+                # 1) Negativas/cortesías puras NUNCA ejecutan cambios, aunque el modelo lo pida.
+                m_low = _norm_nombre(mensaje)
+                es_negativa = m_low in ("no", "por ahora no", "no gracias", "nada mas", "no nada mas",
+                                        "gracias", "perfecto", "ok", "listo", "buenisimo", "dale gracias")
+                if es_negativa:
+                    print(f"[DIAG-GESTION] modificar BLOQUEADO: mensaje es negativa/cortesía pura ('{mensaje}')")
+                    cambios = []
+                # 2) Un "agregar" sobre un producto que YA está en el pedido, cuando NI el mensaje
+                # actual NI el anterior del cliente mencionan ese producto o una cantidad, es una
+                # re-emisión del modelo (pasó con "si"/"por ahora no" y duplicó bultos). Se ignora.
+                # (Se mira también el mensaje anterior para no bloquear el "sí" que confirma un
+                #  "sumale otro X" legítimo del turno previo.)
+                msgs_user = [h.get("content", "") for h in historial if h.get("role") == "user"]
+                m_prev = _norm_nombre(msgs_user[-2]) if len(msgs_user) >= 2 else ""
+                contexto_cliente = f"{m_low} {m_prev}"
+                cambios_filtrados = []
+                for c in cambios:
+                    op_c = (c.get("operacion") or "").lower()
+                    nom_c = c.get("producto", "")
+                    ya_esta = _buscar_item_pedido(items_actuales, nom_c) is not None
+                    menciona = any(tok in contexto_cliente for tok in _norm_nombre(nom_c).split() if len(tok) > 3)
+                    tiene_numero = any(ch.isdigit() for ch in contexto_cliente) or any(
+                        w in contexto_cliente for w in ("un ", "una ", "dos", "tres", "otro", "otra", "mas ", "más "))
+                    if op_c == "agregar" and ya_esta and not menciona and not tiene_numero:
+                        print(f"[DIAG-GESTION] agregar IGNORADO por re-emisión: '{nom_c}' ya está y el cliente no lo mencionó")
+                        continue
+                    cambios_filtrados.append(c)
+                cambios = cambios_filtrados
+
                 no_encontrados = []
                 for c in cambios:
                     op = (c.get("operacion") or "").lower()
                     nombre = c.get("producto", "")
                     cant = int(c.get("cantidad", 1) or 1)
+                    su = (c.get("unidad") or "bulto").lower()
                     existente = _buscar_item_pedido(items_actuales, nombre)
+                    # para unidad suelta, el "existente" debe ser el renglón vendido por unidad
+                    if su == "unidad" and existente and (existente.get("sale_unit") or "bulto") != "unidad":
+                        existente = next((it for it in items_actuales
+                                          if _norm_nombre(it.get("product_name", "")).startswith(_norm_nombre(nombre))
+                                          and (it.get("sale_unit") or "bulto") == "unidad"), None)
                     if op == "quitar":
                         if existente and existente.get("id"):
                             payload.append({"id": existente["id"], "quantity": 0})
@@ -1709,14 +1756,35 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
                         else:
                             no_encontrados.append(nombre)
                     elif op == "agregar":
-                        # Si ya estaba, "agregar" suma a lo existente → cambiar cantidad total
+                        # Si ya estaba (misma forma de venta), "agregar" suma a lo existente
                         if existente and existente.get("id"):
                             actual = int(existente.get("quantity", 0) or 0)
                             payload.append({"id": existente["id"], "quantity": actual + cant})
                         else:
                             prod = cat_por_nombre.get(nombre.lower()) or next(
                                 (p for p in catalogo_nuevos if _norm_nombre(p["product_name"]) == _norm_nombre(nombre)), None)
-                            if prod and prod.get("disponible", 0) > 0:
+                            if not prod:
+                                no_encontrados.append(nombre)
+                                continue
+                            if su == "unidad":
+                                # Venta por unidad suelta: validar que se permita
+                                if not prod.get("permite_unidad") or not prod.get("precio_unidad"):
+                                    no_encontrados.append(f"{nombre} (no se vende por unidad)")
+                                    continue
+                                if prod.get("stock_unidades") is not None and cant > prod["stock_unidades"]:
+                                    cant = prod["stock_unidades"]
+                                if cant <= 0:
+                                    no_encontrados.append(f"{nombre} (sin stock por unidad)")
+                                    continue
+                                payload.append({
+                                    "variant_id": prod["variant_id"],
+                                    "product_id": prod["product_id"],
+                                    "product_name": prod["product_name"] + " (unidad)",
+                                    "quantity": cant,
+                                    "unit_price": prod["precio_unidad"],
+                                    "sale_unit": "unidad",
+                                })
+                            elif prod.get("disponible", 0) > 0:
                                 # Precio según promo (la promo aplica solo por bulto)
                                 is_promo = bool(prod.get("promo_activa") and (prod.get("disponibles_en_promo") or 0) >= cant)
                                 precio = prod["precio_promo"] if is_promo else prod["precio_bulto"]
