@@ -412,11 +412,11 @@ Rutas:
 REGLAS:
 - Si hay un PEDIDO EN CURSO (carrito con productos o tarea de pedido), las preguntas sobre precio, total o el estado del pedido van a PEDIDO, NO a ASESOR. El agente de pedido tiene los precios y el carrito.
 - DISTINCIÓN CLAVE PEDIDO vs GESTION: PEDIDO = el carrito que se está armando ahora. GESTION = un pedido que YA se confirmó antes (pregunta por su estado, quiere cancelarlo o modificarlo).
-- PRIORIDAD DE GESTION (importante): si el cliente hace referencia a un pedido ANTERIOR / YA HECHO / YA CONFIRMADO, o menciona un NÚMERO de pedido (ej. "el 1016", "pedido N° 1015"), o pide "sumá/agregá esto AL PEDIDO ANTERIOR / al que hice / al pedido de antes", es GESTION — AUNQUE haya un carrito armándose en este momento. La mención a un pedido previo gana sobre el carrito en curso.
-- Si NO menciona ningún pedido previo y solo está sumando productos al carrito actual, es PEDIDO.
-- Si hay TAREA EN CURSO y el contacto sigue el hilo → CONTINUAR o PEDIDO según corresponda.
+- GESTIÓN EN CURSO (MÁXIMA PRIORIDAD): si en el CONTEXTO de abajo dice que hay una GESTIÓN DE PEDIDO en curso, entonces TODO lo que siga sobre ese pedido —agregar productos, quitar, cambiar cantidad, preguntar el total o el precio, "cómo queda", confirmaciones ("sí", "dale")— es CONTINUAR (sigue en gestión). NO cambies a PEDIDO solo porque el cliente dice "agregá X": si venías gestionando un pedido confirmado, ese "agregá" es sobre ESE pedido, no un carrito nuevo. Solo salí de gestión si el cliente claramente arranca algo no relacionado (un pedido nuevo explícito, otra consulta).
+- PRIORIDAD DE GESTION: si el cliente hace referencia a un pedido ANTERIOR / YA HECHO / YA CONFIRMADO, o menciona un NÚMERO de pedido (ej. "el 1016", "pedido N° 1015"), o pide "sumá/agregá esto AL PEDIDO ANTERIOR / al que hice", es GESTION — AUNQUE haya un carrito armándose. La mención a un pedido previo gana sobre el carrito en curso.
+- Si NO hay gestión en curso NI menciona un pedido previo, y solo está sumando productos al carrito actual, es PEDIDO.
 - AGENTE_HUMANO solo ante pedido explícito de un humano. Nunca por las dudas.
-- Ante duda: si hay pedido/tarea en curso y NO refiere a un pedido previo, quedate en PEDIDO; si no, CHARLA.
+- Ante duda: si hay gestión en curso, quedate en GESTION (CONTINUAR); si hay carrito y no refiere a pedido previo, PEDIDO; si no, CHARLA.
 
 Devolvé SOLO {{"ruta": "..."}}."""
 
@@ -1313,6 +1313,18 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
     # Si hay carrito en curso y cae en asesor/charla, forzar pedido (red de seguridad)
     if hay_carrito and agente in ("asesor", "charla"):
         agente = "pedido"
+
+    # Red de seguridad de GESTIÓN: si venías gestionando un pedido confirmado y el router
+    # te manda a pedido/asesor SIN señal clara de "pedido nuevo", mantené gestión.
+    # Esto evita que "agregá un combo" (sobre el pedido gestionado) salte a armar un carrito nuevo.
+    if tarea == "gestion" and agente in ("pedido", "asesor"):
+        m_low = (mensaje or "").lower()
+        señal_pedido_nuevo = any(k in m_low for k in [
+            "pedido nuevo", "otro pedido", "nuevo pedido", "empezar de cero",
+            "arrancar otro", "aparte", "por separado", "distinto pedido"])
+        if not señal_pedido_nuevo:
+            print(f"[DIAG-GESTION] router dijo '{agente}' pero mantengo GESTION (venía gestionando)")
+            agente = "gestion"
 
     # ── DESAMBIGUACIÓN "pedido del día" (sin consultar CPM, solo con la marca local) ──
     # Si el cliente arranca un pedido nuevo (no hay carrito) y YA confirmó un pedido HOY,
