@@ -978,13 +978,20 @@ async def cpm_consultar_pedido(tenant_id: str, order_id: str) -> dict:
         if not isinstance(data, dict):
             return {}
         # Formato robusto: puede venir directo, envuelto en "order", o en "orders":[...]
-        if "items" in data:
-            return data
-        if isinstance(data.get("order"), dict):
-            return data["order"]
-        if isinstance(data.get("orders"), list) and data["orders"]:
-            return data["orders"][0]
-        return data
+        ped = None
+        if "items" in data or "order_items" in data:
+            ped = data
+        elif isinstance(data.get("order"), dict):
+            ped = data["order"]
+        elif isinstance(data.get("orders"), list) and data["orders"]:
+            ped = data["orders"][0]
+        else:
+            ped = data
+        # Normalizar: el GET único devuelve los ítems en "order_items"; el de lista en "items".
+        # Dejamos siempre "items" disponible para el resto del código.
+        if isinstance(ped, dict) and "items" not in ped and "order_items" in ped:
+            ped["items"] = ped.get("order_items") or []
+        return ped
     except Exception as e:
         print(f"[cpm_consultar_pedido] excepción: {e}")
         return {}
@@ -1596,14 +1603,24 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
                         if carrito and agregados_nuevos:
                             carrito = []
                             pedido_registrado = {"ok": True, "via_gestion": True}
-                        # Re-consultar el pedido actualizado y generar imagen de resumen
+                        # Re-consultar el pedido actualizado: sirve para la imagen Y para el total real
                         ped_act = await cpm_consultar_pedido(tenant_id, oid)
                         items_act = (ped_act.get("items") if isinstance(ped_act, dict) else None) or []
                         items_img = _items_cpm_a_imagen(items_act)
                         print(f"[DIAG-GESTION-IMG] ped_act_keys={list(ped_act.keys()) if isinstance(ped_act, dict) else 'no-dict'} | items_recibidos={len(items_act)} | items_img={len(items_img)}")
+                        # Total real del pedido tras el cambio (del CPM, no calculado)
+                        total_act = ped_act.get("total") if isinstance(ped_act, dict) else None
+                        if total_act is None and items_img:
+                            total_act = sum(it["precio"] * it["cantidad"] for it in items_img)
+                        # Armar texto con el resumen actualizado y el total
                         if items_img:
+                            detalle = "\n".join(f"• {it['cantidad']}x {it['product_name']}" for it in items_img)
+                            base = texto or f"Listo, actualicé tu pedido N° {objetivo.get('order_number', num_g)}."
+                            texto = f"{base}\n\nQueda así:\n{detalle}"
+                            if total_act is not None:
+                                texto += f"\n\nTotal: ${float(total_act):,.0f}"
                             imagen_url = await generar_imagen_pedido(tenant_id, cfg, items_img)
-                            print(f"[DIAG-GESTION] imagen actualizada='{imagen_url}'")
+                            print(f"[DIAG-GESTION] imagen actualizada='{imagen_url}' | total={total_act}")
                     else:
                         texto = "No pude aplicar el cambio desde acá. Te paso con el equipo."
                 elif no_encontrados:
