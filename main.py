@@ -547,6 +547,7 @@ REGLAS DE NEGOCIO (respetalas SIEMPRE):
 - MODIFICAR (agregar/quitar/cambiar cantidad): permitido SOLO si el pedido está en estado pendiente. Si está en preparación o más avanzado, NO se puede: explicale con calidez que el local ya lo está preparando y ofrecele hacer un pedido nuevo con lo que quiera sumar.
 - CANCELAR: permitido si el pedido está pendiente, en preparación o listo para salir. NO se puede si ya está en camino o entregado: avisale que hable con el equipo.
 - CONSULTAR estado: siempre se puede.
+- PRECIOS Y TOTAL: en la lista de PEDIDOS DEL CLIENTE de arriba tenés el precio de cada producto y el TOTAL de cada pedido. Si el cliente pregunta el precio o el total, RESPONDÉSELO con esos datos. NUNCA digas "no tengo los precios" ni "consultá con el equipo por el total": los datos están arriba, usalos.
 
 QUÉ PEDIDO:
 - Si el cliente menciona un número (ej. "pedido 1015"), buscá ese en la lista de arriba.
@@ -815,6 +816,21 @@ async def generar_imagen_pedido(tenant_id: str, cfg: dict, items: list, delivery
 # OPERACIONES DE PEDIDO VÍA ENDPOINTS DEL CPM
 # ─────────────────────────────────────────────
 
+def _items_cpm_a_imagen(items_cpm: list) -> list:
+    """Convierte items del CPM (quantity/unit_price) al formato que espera generar_imagen_pedido (cantidad/precio)."""
+    out = []
+    for it in items_cpm:
+        cant = int(it.get("quantity", it.get("cantidad", 0)) or 0)
+        if cant <= 0:
+            continue  # ítems borrados (quantity 0) no van en la imagen
+        out.append({
+            "product_name": it.get("product_name", it.get("producto", "Producto")),
+            "cantidad": cant,
+            "precio": float(it.get("unit_price", it.get("precio", 0)) or 0),
+        })
+    return out
+
+
 def _headers_cpm():
     return {"Authorization": f"Bearer {CPM_API_KEY}", "Content-Type": "application/json"}
 
@@ -876,15 +892,25 @@ def formato_pedidos_gestion(pedidos: list) -> str:
         num = p.get("order_number") or "?"
         status = p.get("status", "?")
         items = p.get("items") or []
-        items_txt = ", ".join(
-            f"{it.get('quantity', it.get('cantidad','?'))}x {it.get('product_name', it.get('producto','producto'))}"
-            for it in items
-        ) or "(sin detalle de ítems)"
+        partes = []
+        total_calc = 0
+        for it in items:
+            cant = int(it.get("quantity", it.get("cantidad", 0)) or 0)
+            nombre = it.get("product_name", it.get("producto", "producto"))
+            precio = float(it.get("unit_price", it.get("precio", 0)) or 0)
+            subtotal = precio * cant
+            total_calc += subtotal
+            partes.append(f"{cant}x {nombre} (${precio:,.0f} c/u = ${subtotal:,.0f})")
+        items_txt = "; ".join(partes) or "(sin detalle de ítems)"
+        # total: usar el del CPM si viene, si no el calculado
+        total = p.get("total")
+        total_val = float(total) if total is not None else total_calc
         editable = "SÍ (está pendiente)" if str(status).strip().lower() == "pendiente" else "NO"
         cancelable = "SÍ" if str(status).strip().lower() in ("pendiente", "confirmado", "en_preparacion", "para_enviar") else "NO"
         lineas.append(
             f"- Pedido N° {num} | estado: {_estado_natural(status)} | "
-            f"modificable: {editable} | cancelable: {cancelable} | productos: {items_txt}"
+            f"modificable: {editable} | cancelable: {cancelable} | "
+            f"TOTAL: ${total_val:,.0f} | productos: {items_txt}"
         )
     return "\n".join(lineas)
 
@@ -949,7 +975,16 @@ async def cpm_consultar_pedido(tenant_id: str, order_id: str) -> dict:
             print(f"[cpm_consultar_pedido] status={r.status_code} resp={r.text[:200]}")
             return {}
         data = r.json()
-        return data.get("order", data) if isinstance(data, dict) else {}
+        if not isinstance(data, dict):
+            return {}
+        # Formato robusto: puede venir directo, envuelto en "order", o en "orders":[...]
+        if "items" in data:
+            return data
+        if isinstance(data.get("order"), dict):
+            return data["order"]
+        if isinstance(data.get("orders"), list) and data["orders"]:
+            return data["orders"][0]
+        return data
     except Exception as e:
         print(f"[cpm_consultar_pedido] excepción: {e}")
         return {}
@@ -1499,7 +1534,15 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
             oid = objetivo.get("order_id") or objetivo.get("id")
             if estado == "pendiente":
                 cambios = jd_g.get("cambios") or []
-                items_actuales = objetivo.get("items") or []
+                # GET FRESCO del pedido justo antes de armar el PATCH: los id de ítem
+                # no son estables (si el pedido se modificó antes, los viejos quedan muertos).
+                # Tomamos los id del pedido correcto y recién actualizado.
+                ped_fresco = await cpm_consultar_pedido(tenant_id, oid)
+                items_actuales = (ped_fresco.get("items") if isinstance(ped_fresco, dict) else None)
+                if not items_actuales:
+                    # respaldo: si el GET único no trae items, usar los del listado inicial
+                    items_actuales = objetivo.get("items") or []
+                print(f"[DIAG-GESTION] items_frescos={len(items_actuales)} (del GET previo al PATCH)")
                 payload = []
                 # Nombres de productos NUEVOS a agregar (necesitan datos de catálogo)
                 nombres_nuevos = [c.get("producto", "") for c in cambios
@@ -1553,6 +1596,14 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
                         if carrito and agregados_nuevos:
                             carrito = []
                             pedido_registrado = {"ok": True, "via_gestion": True}
+                        # Re-consultar el pedido actualizado y generar imagen de resumen
+                        ped_act = await cpm_consultar_pedido(tenant_id, oid)
+                        items_act = (ped_act.get("items") if isinstance(ped_act, dict) else None) or []
+                        items_img = _items_cpm_a_imagen(items_act)
+                        print(f"[DIAG-GESTION-IMG] ped_act_keys={list(ped_act.keys()) if isinstance(ped_act, dict) else 'no-dict'} | items_recibidos={len(items_act)} | items_img={len(items_img)}")
+                        if items_img:
+                            imagen_url = await generar_imagen_pedido(tenant_id, cfg, items_img)
+                            print(f"[DIAG-GESTION] imagen actualizada='{imagen_url}'")
                     else:
                         texto = "No pude aplicar el cambio desde acá. Te paso con el equipo."
                 elif no_encontrados:
