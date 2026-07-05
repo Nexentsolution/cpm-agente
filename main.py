@@ -873,7 +873,7 @@ def formato_pedidos_gestion(pedidos: list) -> str:
         pass
     lineas = []
     for p in pedidos[:8]:
-        num = p.get("order_number") or p.get("orderNumber") or p.get("id", "?")
+        num = p.get("order_number") or "?"
         status = p.get("status", "?")
         items = p.get("items") or []
         items_txt = ", ".join(
@@ -881,7 +881,7 @@ def formato_pedidos_gestion(pedidos: list) -> str:
             for it in items
         ) or "(sin detalle de ítems)"
         editable = "SÍ (está pendiente)" if str(status).strip().lower() == "pendiente" else "NO"
-        cancelable = "SÍ" if str(status).strip().lower() in ("pendiente", "en_preparacion", "para_enviar") else "NO"
+        cancelable = "SÍ" if str(status).strip().lower() in ("pendiente", "confirmado", "en_preparacion", "para_enviar") else "NO"
         lineas.append(
             f"- Pedido N° {num} | estado: {_estado_natural(status)} | "
             f"modificable: {editable} | cancelable: {cancelable} | productos: {items_txt}"
@@ -1467,8 +1467,8 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
 
         # Resolver el pedido objetivo: por número si lo dio, si no el más reciente
         def _match_pedido(p):
-            pn = str(p.get("order_number") or p.get("orderNumber") or p.get("id", "")).strip()
-            return pn == num_g or pn.endswith(num_g)
+            pn = str(p.get("order_number") or "").strip()
+            return pn == num_g
         objetivo = None
         if pedidos:
             if num_g:
@@ -1482,8 +1482,8 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
 
         if acc_g == "cancelar" and objetivo:
             estado = str(objetivo.get("status", "")).strip().lower()
-            oid = objetivo.get("id") or objetivo.get("order_id")
-            if estado in ("pendiente", "en_preparacion", "para_enviar"):
+            oid = objetivo.get("order_id") or objetivo.get("id")
+            if estado in ("pendiente", "confirmado", "en_preparacion", "para_enviar"):
                 ok = await cpm_cancelar_pedido(tenant_id, oid)
                 if ok:
                     texto = f"Listo, cancelé tu pedido N° {objetivo.get('order_number', num_g)}. Cualquier cosa, acá estoy."
@@ -1496,7 +1496,7 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
 
         elif acc_g == "modificar" and objetivo:
             estado = str(objetivo.get("status", "")).strip().lower()
-            oid = objetivo.get("id") or objetivo.get("order_id")
+            oid = objetivo.get("order_id") or objetivo.get("id")
             if estado == "pendiente":
                 cambios = jd_g.get("cambios") or []
                 items_actuales = objetivo.get("items") or []
