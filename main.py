@@ -907,6 +907,99 @@ def _headers_cpm():
     return {"Authorization": f"Bearer {CPM_API_KEY}", "Content-Type": "application/json"}
 
 
+async def cpm_get_modo(tenant_id: str, manychat_contact_id: str) -> str:
+    """GET /conversation-mode — modo de la conversación: auto | copilot | manual.
+       Se consulta ANTES de cada mensaje (el operador puede cambiarlo en vivo).
+       Ante error, default 'auto' (no dejar al contacto sin respuesta)."""
+    try:
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+            r = await client.get(
+                f"{CPM_API_URL}/conversation-mode",
+                headers=_headers_cpm(),
+                params={"tenant_id": tenant_id, "manychat_contact_id": manychat_contact_id},
+            )
+        if r.status_code != 200:
+            print(f"[cpm_get_modo] status={r.status_code} → default auto")
+            return "auto"
+        modo = (r.json() or {}).get("mode", "auto")
+        return modo if modo in ("auto", "copilot", "manual") else "auto"
+    except Exception as e:
+        print(f"[cpm_get_modo] excepción: {e} → default auto")
+        return "auto"
+
+
+async def cpm_post_suggestions(tenant_id: str, manychat_contact_id: str, suggestions: list) -> bool:
+    """POST /suggestions — propuestas de respuesta para el operador (modo copilot).
+       Máx 3. Cada tanda pisa las pendientes anteriores (lo maneja el CPM)."""
+    try:
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            r = await client.post(
+                f"{CPM_API_URL}/suggestions",
+                headers=_headers_cpm(),
+                json={"tenant_id": tenant_id, "manychat_contact_id": manychat_contact_id,
+                      "suggestions": suggestions[:3]},
+            )
+        if r.status_code not in (200, 201):
+            print(f"[cpm_post_suggestions] status={r.status_code} resp={r.text[:150]}")
+            return False
+        return True
+    except Exception as e:
+        print(f"[cpm_post_suggestions] excepción: {e}")
+        return False
+
+
+async def cpm_post_draft_order(tenant_id: str, manychat_contact_id: str, items: list) -> bool:
+    """POST /draft-order — borrador de pedido para que el operador valide (copilot).
+       SIEMPRE el carrito completo, no deltas. items=[] lo limpia.
+       No manda discount_pct (exclusivo del operador; el CPM lo preserva)."""
+    payload_items = []
+    for it in items:
+        item = {
+            "product_id": it["product_id"],
+            "variant_id": it["variant_id"],
+            "product_name": it["product_name"],
+            "quantity": it["cantidad"],
+            "unit_price": it["precio"],
+        }
+        if it.get("sale_unit") and it["sale_unit"] != "bulto":
+            item["sale_unit"] = it["sale_unit"]
+        payload_items.append(item)
+    try:
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            r = await client.post(
+                f"{CPM_API_URL}/draft-order",
+                headers=_headers_cpm(),
+                json={"tenant_id": tenant_id, "manychat_contact_id": manychat_contact_id,
+                      "items": payload_items},
+            )
+        if r.status_code not in (200, 201):
+            print(f"[cpm_post_draft_order] status={r.status_code} resp={r.text[:150]}")
+            return False
+        return True
+    except Exception as e:
+        print(f"[cpm_post_draft_order] excepción: {e}")
+        return False
+
+
+async def generar_variantes_sugerencia(cfg: dict, texto_base: str, mensaje_cliente: str) -> list:
+    """Modo copilot: a partir de la respuesta del pipeline, genera hasta 2 variantes cortas.
+       Una sola llamada breve. Si falla, se manda solo la base."""
+    try:
+        prompt = (f"{_ctx_tenant(cfg)}\n\nSos el asistente de un operador humano que atiende WhatsApp. "
+                  f"El cliente escribió: \"{mensaje_cliente}\". La respuesta sugerida es: \"{texto_base}\".\n"
+                  f"Generá 2 variantes de esa misma respuesta: una más breve y directa, otra un poco más cálida. "
+                  f"Mismo contenido e información (no inventes datos ni precios nuevos). "
+                  f"Devolvé SOLO un JSON array de 2 strings, sin nada más.")
+        raw = await llamar_claude(prompt, [{"role": "user", "content": mensaje_cliente}], max_tokens=300)
+        limpio = raw.strip().replace("```json", "").replace("```", "").strip()
+        variantes = json.loads(limpio)
+        if isinstance(variantes, list):
+            return [str(v) for v in variantes[:2] if v]
+    except Exception as e:
+        print(f"[variantes_sugerencia] fallo (se manda solo la base): {e}")
+    return []
+
+
 def _norm_nombre(s: str) -> str:
     """Normaliza un nombre de producto para comparar: sin acentos, minúsculas, espacios colapsados."""
     import unicodedata
@@ -1378,7 +1471,7 @@ async def clasificar_ruta(cfg: dict, historial: list, mensaje: str, tarea: str, 
     return ruta if ruta in RUTAS_VALIDAS else "CHARLA"
 
 
-async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
+async def manejar_turno(tenant: dict, contact_id: str, mensaje: str, modo: str = "auto"):
     tenant_id = tenant["tenant_id"]
     cfg = tenant["settings"]
     imagen_url = ""  # URL de imagen del resumen de pedido, si se genera
@@ -1462,6 +1555,7 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
 
     # Carrito actual (lo necesita el agente pedido)
     carrito = carrito_previo
+    _snapshot_carrito = json.dumps(carrito_previo, sort_keys=True, default=str)  # para detectar cambios (copilot)
     pedido_registrado = None
     marca_pedido = None  # (fecha_iso, order_number) si se confirma un pedido en este turno
     gestion_completada = False  # True cuando gestión ejecutó una acción y cierra el hilo
@@ -1591,6 +1685,13 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
         elif accion == "confirmar":
             if not carrito:
                 texto = "No tengo productos en el pedido todavía. ¿Qué te gustaría llevar?"
+            elif modo == "copilot":
+                # COPILOT: el bot NUNCA crea el pedido. El operador lo confirma desde el panel
+                # (botón sobre el draft-order). Solo se sugiere la respuesta de cierre.
+                total = total_pedido(carrito)
+                texto = (f"¡Listo! Tomamos tu pedido por un total de ${total:,.0f}. "
+                         f"En breve te llega la confirmación. ¡Gracias!")
+                print(f"[COPILOT] confirmar detectado — NO se crea pedido (lo valida el operador). total=${total:,.0f}")
             else:
                 total = total_pedido(carrito)
                 # Crear el pedido en el CPM (estado pendiente), vinculado al contacto de ManyChat
@@ -1625,7 +1726,7 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
         cambio = _resumen_carrito(carrito_antes) != _resumen_carrito(carrito)
         pidio_resumen = accion == "resumen"
         print(f"[DIAG-IMG] cambio={cambio} | pidio_resumen={pidio_resumen} | items={len(carrito)}")
-        if carrito and not pedido_registrado and (cambio or pidio_resumen):
+        if carrito and not pedido_registrado and (cambio or pidio_resumen) and modo != "copilot":
             from datetime import timedelta
             delivery = (datetime.utcnow() + timedelta(days=1)).date().strftime("%d/%m/%Y")
             imagen_url = await generar_imagen_pedido(tenant_id, cfg, carrito, delivery)
@@ -1667,6 +1768,12 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
                     objetivo = sorted(pedidos, key=lambda p: p.get("created_at", ""), reverse=True)[0]
                 except Exception:
                     objetivo = pedidos[0]
+
+        # COPILOT: gestión NUNCA ejecuta cambios reales (cancelar/modificar) — el operador valida.
+        # Se neutraliza la acción y el texto del modelo queda como propuesta de respuesta.
+        if modo == "copilot" and acc_g in ("cancelar", "modificar"):
+            print(f"[COPILOT] gestión '{acc_g}' detectada — NO se ejecuta (lo valida el operador). jd={jd_g}")
+            acc_g = "nada"
 
         if acc_g == "cancelar" and objetivo:
             estado = str(objetivo.get("status", "")).strip().lower()
@@ -1890,6 +1997,21 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str):
     await upsert_conversacion(tenant_id, contact_id, campos_persist)
     await guardar_log(tenant_id, contact_id, agente, mensaje, texto)
 
+    # ── MODO COPILOT: el contacto NO recibe respuesta del bot. Se entregan
+    # sugerencias al operador y se actualiza el borrador de pedido si cambió. ──
+    if modo == "copilot":
+        sugerencias = [texto] if texto else []
+        if texto:
+            variantes = await generar_variantes_sugerencia(cfg, texto, mensaje)
+            sugerencias += variantes
+        if sugerencias:
+            await cpm_post_suggestions(tenant_id, contact_id, sugerencias)
+        carrito_cambio = json.dumps(carrito, sort_keys=True, default=str) != _snapshot_carrito
+        if carrito_cambio:
+            await cpm_post_draft_order(tenant_id, contact_id, carrito)
+        print(f"[COPILOT] sugerencias={len(sugerencias)} | draft_actualizado={carrito_cambio}")
+        return agente, "", json_data, ""  # ManyChat no envía nada al contacto
+
     return agente, texto, json_data, imagen_url
 
 
@@ -1935,6 +2057,11 @@ async def orquestador(request: Request):
     tenant = await resolver_tenant(page_id)
     if not tenant:
         return JSONResponse(_respuesta_unificada("charla", "No encontré la configuración de este negocio. Avisá al administrador.", {}))
+
+    # Modo de la conversación (auto/copilot/manual). Se consulta ANTES de cada
+    # mensaje porque el operador puede cambiarlo en vivo desde el inbox.
+    modo = await cpm_get_modo(tenant["tenant_id"], contact_id)
+    print(f"[MODO] {modo}")
 
     transcripcion = ""  # se llena solo si el mensaje fue un audio
 
@@ -1993,7 +2120,26 @@ async def orquestador(request: Request):
     if not transcripcion:
         transcripcion = mensaje
 
-    agente, texto, json_data, imagen_url = await manejar_turno(tenant, contact_id, mensaje)
+    # MODO MANUAL: el humano atiende solo. Cero llamadas al modelo.
+    # Solo guardamos el mensaje en el historial (para que el bot tenga contexto
+    # si el operador vuelve a auto/copilot) y devolvemos respuesta vacía.
+    if modo == "manual":
+        try:
+            conv = await get_conversacion(tenant["tenant_id"], contact_id)
+            historial = conv["historial"]
+            historial.append({"role": "user", "content": mensaje})
+            if len(historial) > 40:
+                historial = historial[-40:]
+            await upsert_conversacion(tenant["tenant_id"], contact_id, {"historial": historial})
+        except Exception as e:
+            print(f"[MANUAL] no se pudo guardar historial: {e}")
+        resp = _respuesta_unificada("manual", "", {}, transcripcion)
+        resp["modo"] = "manual"
+        return JSONResponse(resp)
+
+    agente, texto, json_data, imagen_url = await manejar_turno(tenant, contact_id, mensaje, modo=modo)
     if texto is None:
         return JSONResponse(_respuesta_unificada("charla", "Tardé más de lo esperado. ¿Podés repetir tu mensaje?", {}, transcripcion))
-    return JSONResponse(_respuesta_unificada(agente, texto, json_data, transcripcion, imagen_url))
+    resp = _respuesta_unificada(agente, texto, json_data, transcripcion, imagen_url)
+    resp["modo"] = modo
+    return JSONResponse(resp)
