@@ -27,6 +27,8 @@ CPM_API_URL = os.environ.get("CPM_API_URL", "https://cpm-nexent.vercel.app/api/a
 CPM_API_KEY = os.environ.get("CPM_API_KEY", os.environ.get("SUPABASE_KEY", ""))
 
 TABLA_CONV = "conversaciones_cpm"
+# Marca interna para sugerencias de copilot aún no confirmadas como enviadas por el operador
+MARCA_SUGERENCIA = "[SUGERENCIA AL OPERADOR — sin confirmación de envío] "
 TABLA_LOGS = "logs_cpm"
 
 # Cache simple de tenants en memoria (page_id -> {tenant_id, settings}).
@@ -98,29 +100,45 @@ async def resolver_tenant(page_id: str) -> dict:
 # SUPABASE — conversaciones (con tenant_id)
 # ─────────────────────────────────────────────
 
+COLS_CONV_FULL = "historial,agente_activo,tarea_pendiente,pedido_en_curso,direccion_entrega,ultimo_pedido_fecha,ultimo_pedido_num,cliente_representado"
+COLS_CONV_BASE = "historial,agente_activo,tarea_pendiente,pedido_en_curso,direccion_entrega"
+
+_CONV_DEFAULT = {"historial": [], "agente_activo": "none", "tarea": "", "pedido": [], "direccion": "",
+                 "ultimo_pedido_fecha": "", "ultimo_pedido_num": "", "cliente_representado": None}
+
+
 async def get_conversacion(tenant_id: str, contact_id: str) -> dict:
+    """Carga el estado de la conversación. Si el SELECT falla por columnas faltantes
+       (migración SQL no corrida), LOGGEA el error y degrada a las columnas base —
+       NUNCA amnesia silenciosa: perder el historial rompe todo el hilo del bot."""
     async with httpx.AsyncClient() as client:
-        r = await client.get(
-            f"{SUPABASE_URL}/rest/v1/{TABLA_CONV}",
-            headers=_headers(),
-            params={"tenant_id": f"eq.{tenant_id}", "contact_id": f"eq.{contact_id}",
-                    "select": "historial,agente_activo,tarea_pendiente,pedido_en_curso,direccion_entrega,ultimo_pedido_fecha,ultimo_pedido_num,cliente_representado"}
-        )
-        data = r.json()
-        if isinstance(data, list) and len(data) > 0:
-            d = data[0]
-            return {
-                "historial": d.get("historial") or [],
-                "agente_activo": d.get("agente_activo") or "none",
-                "tarea": str(d.get("tarea_pendiente") or "").strip().lower(),
-                "pedido": d.get("pedido_en_curso") or [],
-                "direccion": d.get("direccion_entrega") or "",
-                "ultimo_pedido_fecha": d.get("ultimo_pedido_fecha") or "",
-                "ultimo_pedido_num": d.get("ultimo_pedido_num") or "",
-                "cliente_representado": d.get("cliente_representado"),
-            }
-        return {"historial": [], "agente_activo": "none", "tarea": "", "pedido": [], "direccion": "",
-                "ultimo_pedido_fecha": "", "ultimo_pedido_num": "", "cliente_representado": None}
+        for select_cols in (COLS_CONV_FULL, COLS_CONV_BASE):
+            r = await client.get(
+                f"{SUPABASE_URL}/rest/v1/{TABLA_CONV}",
+                headers=_headers(),
+                params={"tenant_id": f"eq.{tenant_id}", "contact_id": f"eq.{contact_id}",
+                        "select": select_cols}
+            )
+            data = r.json()
+            if isinstance(data, list):
+                if not data:
+                    return dict(_CONV_DEFAULT)
+                d = data[0]
+                return {
+                    "historial": d.get("historial") or [],
+                    "agente_activo": d.get("agente_activo") or "none",
+                    "tarea": str(d.get("tarea_pendiente") or "").strip().lower(),
+                    "pedido": d.get("pedido_en_curso") or [],
+                    "direccion": d.get("direccion_entrega") or "",
+                    "ultimo_pedido_fecha": d.get("ultimo_pedido_fecha") or "",
+                    "ultimo_pedido_num": d.get("ultimo_pedido_num") or "",
+                    "cliente_representado": d.get("cliente_representado"),
+                }
+            # data no es lista → error de PostgREST (ej. columna inexistente). VISIBLE y reintento base.
+            print(f"[get_conversacion] ⚠️ ERROR del SELECT (status={r.status_code}): {str(data)[:300]}")
+            print(f"[get_conversacion] ⚠️ Probable migración SQL faltante. Reintentando con columnas base…")
+    print(f"[get_conversacion] ⚠️ FALLÓ también con columnas base — devolviendo conversación vacía")
+    return dict(_CONV_DEFAULT)
 
 
 async def upsert_conversacion(tenant_id: str, contact_id: str, campos: dict):
@@ -958,6 +976,44 @@ def _headers_cpm():
     return {"Authorization": f"Bearer {CPM_API_KEY}", "Content-Type": "application/json"}
 
 
+FEEDBACK_POS = "👍 Muy buena"
+FEEDBACK_NEG = "👎 Puede mejorar"
+
+
+async def manychat_enviar_botones(token: str, subscriber_id: str, texto: str, captions: list) -> bool:
+    """Envía por la API de ManyChat un mensaje con botones de respuesta rápida (WhatsApp).
+       Al tocar un botón, el caption vuelve al orquestador como mensaje normal del contacto.
+       Fire-and-forget: si falla, se loggea y no rompe el flujo."""
+    try:
+        payload = {
+            "subscriber_id": subscriber_id,
+            "data": {
+                "version": "v2",
+                "content": {
+                    "type": "whatsapp",
+                    "messages": [{
+                        "type": "text",
+                        "text": texto,
+                        "buttons": [{"type": "text", "caption": c} for c in captions[:3]],
+                    }],
+                },
+            },
+        }
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.post(
+                "https://api.manychat.com/fb/sending/sendContent",
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                json=payload,
+            )
+        if r.status_code != 200:
+            print(f"[manychat_botones] status={r.status_code} resp={r.text[:250]}")
+            return False
+        return True
+    except Exception as e:
+        print(f"[manychat_botones] excepción: {e}")
+        return False
+
+
 async def cpm_get_modo(tenant_id: str, manychat_contact_id: str) -> str:
     """GET /conversation-mode — modo de la conversación: auto | copilot | manual.
        Se consulta ANTES de cada mensaje (el operador puede cambiarlo en vivo).
@@ -1570,6 +1626,25 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str, modo: str =
     carrito_previo = conv["pedido"] if isinstance(conv["pedido"], list) else []
     hay_carrito = len(carrito_previo) > 0
 
+    # ── INTERCEPTOR DE FEEDBACK (botones 👍/👎, cero llamadas al modelo) ──
+    m_fb = (mensaje or "").strip()
+    if m_fb.startswith("👍") or m_fb == FEEDBACK_POS:
+        texto = "¡Gracias! Nos alegra un montón haberte ayudado 💜 Cualquier cosa que necesites, acá estoy."
+        historial.append({"role": "user", "content": mensaje})
+        historial.append({"role": "assistant", "content": texto})
+        await upsert_conversacion(tenant_id, contact_id, {"historial": historial})
+        await guardar_log(tenant_id, contact_id, "feedback", mensaje, texto)
+        print("[FEEDBACK] positivo 👍")
+        return "charla", ("" if modo != "auto" else texto), {}, ""
+    if m_fb.startswith("👎") or m_fb == FEEDBACK_NEG:
+        texto = "Uy, lamento que no haya sido lo que esperabas 🙏 ¿En qué puedo mejorar? Tu comentario nos sirve muchísimo."
+        historial.append({"role": "user", "content": mensaje})
+        historial.append({"role": "assistant", "content": texto})
+        await upsert_conversacion(tenant_id, contact_id, {"historial": historial})
+        await guardar_log(tenant_id, contact_id, "feedback", mensaje, texto)
+        print("[FEEDBACK] negativo 👎")
+        return "charla", ("" if modo != "auto" else texto), {}, ""
+
     ruta = await clasificar_ruta(cfg, historial, mensaje, tarea, hay_carrito)
 
     if ruta == "CONTINUAR":
@@ -2179,7 +2254,27 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str, modo: str =
     else:
         json_data = {}
 
-    historial.append({"role": "assistant", "content": texto})
+    # Disparador de FEEDBACK: cuando se confirmó un pedido nuevo exitosamente (modo auto,
+    # cliente final), el flow de ManyChat muestra los botones 👍/👎. Solo pedidos nuevos
+    # reales: no aplica a modificaciones vía gestión ni a vendedores (usuarios internos).
+    if (pedido_registrado and pedido_registrado.get("ok")
+            and not pedido_registrado.get("via_gestion")
+            and not es_vendedor and modo == "auto"):
+        json_data["pedido_confirmado"] = True
+        # Enviar la pregunta de feedback con botones DIRECTO por la API de ManyChat
+        # (sin flow): al tocar un botón, el caption vuelve como mensaje y lo intercepta el bot.
+        await manychat_enviar_botones(
+            tenant.get("manychat_token", MANYCHAT_API_KEY), contact_id,
+            "¿Qué te pareció mi asistencia para hacer el pedido?",
+            [FEEDBACK_POS, FEEDBACK_NEG])
+
+    # En COPILOT, lo que se guarda NO es un mensaje enviado: es la sugerencia principal.
+    # Se marca como pendiente; cuando el CPM avise qué mandó realmente el operador
+    # (POST /operador-mensaje), esa marca se reemplaza por el texto real.
+    if modo == "copilot" and texto:
+        historial.append({"role": "assistant", "content": f"{MARCA_SUGERENCIA}{texto}"})
+    else:
+        historial.append({"role": "assistant", "content": texto})
 
     # Persistir (incluye carrito actualizado)
     nueva_tarea = agente if agente in AGENTES_CONTENIDO else ""
@@ -2249,6 +2344,7 @@ def _respuesta_unificada(agente, texto, json_data, transcripcion="", imagen_pedi
         "escalar": bool(jd.get("escalar", False)) if agente == "agente_humano" else False,
         "transcripcion": transcripcion or "",
         "imagen_pedido": imagen_pedido or "",
+        "pedido_confirmado": "si" if jd.get("pedido_confirmado") else "",
     }
 
 
@@ -2274,6 +2370,45 @@ async def _responder_segun_modo(modo: str, tenant_id: str, contact_id: str,
         resp = _respuesta_unificada(agente, texto, {}, transcripcion)
     resp["modo"] = modo
     return JSONResponse(resp)
+
+
+@app.post("/operador-mensaje")
+async def operador_mensaje(request: Request):
+    """El CPM avisa qué mensaje envió REALMENTE el operador humano (copilot/manual).
+       Reemplaza la última sugerencia pendiente del historial por el texto real,
+       para que el bot siga la conversación verdadera y no la que imaginó.
+       Auth: mismo Bearer AGENT_API_SECRET de los endpoints /api/agent/*."""
+    auth = request.headers.get("authorization", "")
+    if auth != f"Bearer {CPM_API_KEY}":
+        return JSONResponse({"ok": False, "error": "no autorizado"}, status_code=401)
+    body = await request.json()
+    tenant_id = str(body.get("tenant_id", "") or "").strip()
+    contact_id = str(body.get("manychat_contact_id", "") or "").strip()
+    texto_real = str(body.get("texto", "") or "").strip()
+    if not tenant_id or not contact_id or not texto_real:
+        return JSONResponse({"ok": False, "error": "faltan tenant_id, manychat_contact_id o texto"}, status_code=400)
+    try:
+        conv = await get_conversacion(tenant_id, contact_id)
+        historial = conv["historial"]
+        # Reemplazar la última sugerencia pendiente por el mensaje real del operador.
+        # Si no hay pendiente (operador escribió sin sugerencia, o modo manual), se agrega.
+        reemplazado = False
+        for i in range(len(historial) - 1, -1, -1):
+            h = historial[i]
+            if h.get("role") == "assistant" and str(h.get("content", "")).startswith(MARCA_SUGERENCIA):
+                historial[i] = {"role": "assistant", "content": texto_real}
+                reemplazado = True
+                break
+        if not reemplazado:
+            historial.append({"role": "assistant", "content": texto_real})
+        if len(historial) > 40:
+            historial = historial[-40:]
+        await upsert_conversacion(tenant_id, contact_id, {"historial": historial})
+        print(f"[OPERADOR-MSG] guardado ({'reemplazó sugerencia' if reemplazado else 'append'}): {texto_real[:80]}")
+        return JSONResponse({"ok": True, "reemplazo": reemplazado})
+    except Exception as e:
+        print(f"[OPERADOR-MSG] error: {e}")
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
 
 @app.post("/orquestador")
