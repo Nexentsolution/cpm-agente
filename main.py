@@ -5,7 +5,7 @@ import httpx
 import os
 import json
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 
 app = FastAPI()
 
@@ -1014,6 +1014,66 @@ async def manychat_enviar_botones(token: str, subscriber_id: str, texto: str, ca
         return False
 
 
+async def manychat_enviar_texto(token: str, subscriber_id: str, texto: str) -> bool:
+    """Envía un mensaje de texto simple por la API de ManyChat."""
+    try:
+        payload = {"subscriber_id": subscriber_id,
+                   "data": {"version": "v2", "content": {"type": "whatsapp",
+                            "messages": [{"type": "text", "text": texto}]}}}
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.post(
+                "https://api.manychat.com/fb/sending/sendContent",
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                json=payload,
+            )
+        if r.status_code != 200:
+            print(f"[manychat_texto] status={r.status_code} resp={r.text[:200]}")
+            return False
+        return True
+    except Exception as e:
+        print(f"[manychat_texto] excepción: {e}")
+        return False
+
+
+async def manychat_enviar_imagen(token: str, subscriber_id: str, image_url: str, caption: str = "") -> bool:
+    """Envía una imagen (y caption opcional) por la API de ManyChat al contacto."""
+    try:
+        messages = [{"type": "image", "url": image_url}]
+        if caption:
+            messages.append({"type": "text", "text": caption})
+        payload = {"subscriber_id": subscriber_id,
+                   "data": {"version": "v2", "content": {"type": "whatsapp", "messages": messages}}}
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.post(
+                "https://api.manychat.com/fb/sending/sendContent",
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                json=payload,
+            )
+        if r.status_code != 200:
+            print(f"[manychat_imagen] status={r.status_code} resp={r.text[:250]}")
+            return False
+        return True
+    except Exception as e:
+        print(f"[manychat_imagen] excepción: {e}")
+        return False
+
+
+async def get_token_manychat_por_tenant(tenant_id: str) -> str:
+    """Token de ManyChat del tenant (para endpoints que no reciben page_id)."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(
+                f"{SUPABASE_URL}/rest/v1/channel_connections",
+                headers=_headers(),
+                params={"tenant_id": f"eq.{tenant_id}", "select": "manychat_api_token", "limit": "1"})
+        data = r.json()
+        if isinstance(data, list) and data:
+            return data[0].get("manychat_api_token") or MANYCHAT_API_KEY
+    except Exception as e:
+        print(f"[get_token_manychat] excepción: {e}")
+    return MANYCHAT_API_KEY
+
+
 async def cpm_get_modo(tenant_id: str, manychat_contact_id: str) -> str:
     """GET /conversation-mode — modo de la conversación: auto | copilot | manual.
        Se consulta ANTES de cada mensaje (el operador puede cambiarlo en vivo).
@@ -1035,16 +1095,74 @@ async def cpm_get_modo(tenant_id: str, manychat_contact_id: str) -> str:
         return "auto"
 
 
-async def cpm_post_suggestions(tenant_id: str, manychat_contact_id: str, suggestions: list) -> bool:
+_stats_cache = {}
+STATS_TTL = 300
+
+
+async def cpm_contact_stats(tenant_id: str, contact_id: str = None, manychat_contact_id: str = None) -> dict:
+    """GET /contact-stats — ficha comercial del cliente: pedidos, ticket, frecuencia,
+       productos frecuentes y pedido_frecuente/pedido_ultimo (para 'lo de siempre').
+       Cache 5 min por contacto. Acepta contact_id (vendedor) o manychat_contact_id (cliente)."""
+    clave = f"{tenant_id}:{contact_id or manychat_contact_id}"
+    ahora = datetime.utcnow().timestamp()
+    c = _stats_cache.get(clave)
+    if c and (ahora - c["ts"]) < STATS_TTL:
+        return c["data"]
+    params = {"tenant_id": tenant_id}
+    if contact_id:
+        params["contact_id"] = contact_id
+    else:
+        params["manychat_contact_id"] = manychat_contact_id or ""
+    try:
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+            r = await client.get(f"{CPM_API_URL}/contact-stats", headers=_headers_cpm(), params=params)
+        if r.status_code != 200:
+            print(f"[cpm_contact_stats] status={r.status_code} resp={r.text[:150]}")
+            return {}
+        data = r.json() or {}
+        _stats_cache[clave] = {"ts": ahora, "data": data}
+        return data
+    except Exception as e:
+        print(f"[cpm_contact_stats] excepción: {e}")
+        return {}
+
+
+def _ficha_cliente_txt(stats: dict) -> str:
+    """Resumen de una línea de la ficha comercial para contexto de sugerencias."""
+    if not stats or not stats.get("total_pedidos"):
+        return ""
+    partes = [f"{stats.get('total_pedidos')} pedidos"]
+    if stats.get("ticket_promedio"):
+        partes.append(f"ticket promedio ${float(stats['ticket_promedio']):,.0f}")
+    if stats.get("frecuencia_dias"):
+        partes.append(f"compra cada ~{stats['frecuencia_dias']} días")
+    if stats.get("dias_desde_ultima_compra") is not None:
+        partes.append(f"última compra hace {stats['dias_desde_ultima_compra']} días")
+    pf = stats.get("productos_frecuentes") or []
+    if pf:
+        partes.append("suele llevar: " + ", ".join(p.get("product_name", "") for p in pf[:3]))
+    return " | ".join(partes)
+
+
+async def cpm_post_suggestions(tenant_id: str, manychat_contact_id: str, suggestions: list,
+                               priority: str = None, priority_reason: str = None,
+                               followup: dict = None) -> bool:
     """POST /suggestions — propuestas de respuesta para el operador (modo copilot).
        Máx 3. Cada tanda pisa las pendientes anteriores (lo maneja el CPM)."""
     try:
         async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            body = {"tenant_id": tenant_id, "manychat_contact_id": manychat_contact_id,
+                    "suggestions": suggestions[:3]}
+            if priority in ("alta", "normal"):
+                body["priority"] = priority
+                if priority_reason:
+                    body["priority_reason"] = priority_reason[:120]
+            if followup and isinstance(followup, dict) and followup.get("texto"):
+                body["followup"] = followup
             r = await client.post(
                 f"{CPM_API_URL}/suggestions",
                 headers=_headers_cpm(),
-                json={"tenant_id": tenant_id, "manychat_contact_id": manychat_contact_id,
-                      "suggestions": suggestions[:3]},
+                json=body,
             )
         if r.status_code not in (200, 201):
             print(f"[cpm_post_suggestions] status={r.status_code} resp={r.text[:150]}")
@@ -1089,7 +1207,8 @@ async def cpm_post_draft_order(tenant_id: str, manychat_contact_id: str, items: 
 
 
 async def generar_variantes_sugerencia(cfg: dict, texto_base: str, mensaje_cliente: str,
-                                       promos_txt: str = "", ctx_pedido: str = "") -> list:
+                                       promos_txt: str = "", ctx_pedido: str = "",
+                                       ficha_cliente: str = "") -> dict:
     """MODO COPILOT — rol: asistir al OPERADOR HUMANO que atiende al cliente.
        La respuesta base ya existe; acá se genera UNA alternativa que sea el mejor
        CAMINO DISTINTO razonable para ese momento de la conversación (no una
@@ -1098,6 +1217,8 @@ async def generar_variantes_sugerencia(cfg: dict, texto_base: str, mensaje_clien
         ctx = ""
         if ctx_pedido:
             ctx += f"\nContexto: {ctx_pedido}"
+        if ficha_cliente:
+            ctx += f"\nFicha del cliente: {ficha_cliente}"
         if promos_txt:
             ctx += f"\nPromos activas (por si aplican): {promos_txt}"
         prompt = (f"{_ctx_tenant(cfg)}\n\n"
@@ -1111,15 +1232,20 @@ async def generar_variantes_sugerencia(cfg: dict, texto_base: str, mensaje_clien
                   f"si el cliente quiere pedir y tiene un pedido abierto, un camino suma a ese pedido y el otro "
                   f"propone uno nuevo para no mezclar; si el camino 1 informa, el 2 avanza la conversación. "
                   f"Datos reales solamente (nunca inventes precios ni productos). Breve, tono WhatsApp argentino.\n"
-                  f"Devolvé SOLO un JSON array con 1 string, sin nada más.")
-        raw = await llamar_claude(prompt, [{"role": "user", "content": mensaje_cliente}], max_tokens=250)
+                  f"ADEMÁS evaluá el mensaje del cliente: si trae enojo, reclamo, urgencia real o riesgo de "
+                  f"perderlo, urgencia es \"alta\" (y motivo corto); si no, \"normal\".\n"
+                  f"Devolvé SOLO este JSON, sin nada más: "
+                  f'{{"alternativa": "...", "urgencia": "alta|normal", "motivo": "..."}}')
+        raw = await llamar_claude(prompt, [{"role": "user", "content": mensaje_cliente}], max_tokens=300)
         limpio = raw.strip().replace("```json", "").replace("```", "").strip()
-        variantes = json.loads(limpio)
-        if isinstance(variantes, list):
-            return [str(v) for v in variantes[:1] if v]
+        jd = json.loads(limpio)
+        if isinstance(jd, dict):
+            return {"alternativa": str(jd.get("alternativa", "") or ""),
+                    "urgencia": jd.get("urgencia", "normal") if jd.get("urgencia") in ("alta", "normal") else "normal",
+                    "motivo": str(jd.get("motivo", "") or "")}
     except Exception as e:
         print(f"[variantes_sugerencia] fallo (se manda solo la base): {e}")
-    return []
+    return {"alternativa": "", "urgencia": "normal", "motivo": ""}
 
 
 def _promos_compactas(lista: list) -> str:
@@ -1474,17 +1600,23 @@ def tipo_de_url(texto: str) -> str:
 
 
 async def transcribir_audio(audio_url: str) -> str:
-    """Descarga el audio y lo transcribe con Whisper (OpenAI). Devuelve texto o None."""
+    """Descarga el audio y lo transcribe con Whisper (OpenAI). Devuelve texto o None.
+       Timeouts CORTOS y separados: ManyChat corta el request a los ~10s, así que ante
+       S3/Whisper lentos preferimos fallar rápido y responder degradado a colgarnos."""
     if not OPENAI_KEY:
         print("[transcribir_audio] falta OPENAI_KEY")
         return None
+    t0 = datetime.utcnow().timestamp()
+    print(f"[transcribir_audio] inicio")
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(6.0, connect=4.0)) as client:
             ar = await client.get(audio_url)
-            if ar.status_code != 200:
-                print(f"[transcribir_audio] descarga falló status={ar.status_code}")
-                return None
-            audio_bytes = ar.content
+        if ar.status_code != 200:
+            print(f"[transcribir_audio] descarga falló status={ar.status_code} en {datetime.utcnow().timestamp()-t0:.1f}s")
+            return None
+        audio_bytes = ar.content
+        print(f"[transcribir_audio] descargado {len(audio_bytes)} bytes en {datetime.utcnow().timestamp()-t0:.1f}s")
+        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=5.0)) as client:
             r = await client.post(
                 "https://api.openai.com/v1/audio/transcriptions",
                 headers={"Authorization": f"Bearer {OPENAI_KEY}"},
@@ -1493,11 +1625,13 @@ async def transcribir_audio(audio_url: str) -> str:
             )
         data = r.json()
         if "text" not in data:
-            print(f"[transcribir_audio] sin text | status={r.status_code} resp={data}")
+            print(f"[transcribir_audio] sin text | status={r.status_code} resp={str(data)[:150]}")
             return None
-        return data["text"].strip()
+        txt = data["text"].strip()
+        print(f"[transcribir_audio] ok en {datetime.utcnow().timestamp()-t0:.1f}s ({len(txt)} chars)")
+        return txt
     except Exception as e:
-        print(f"[transcribir_audio] excepción: {e}")
+        print(f"[transcribir_audio] excepción tras {datetime.utcnow().timestamp()-t0:.1f}s: {e}")
         return None
 
 
@@ -1574,6 +1708,30 @@ Respondé SOLO con este JSON:
 RUTAS_VALIDAS = ("ASESOR", "PEDIDO", "GESTION", "CONTINUAR", "CHARLA", "AGENTE_HUMANO")
 AGENTES_CONTENIDO = ("asesor", "pedido", "gestion", "agente_humano")
 
+# Señales de que el cliente arranca un pedido NUEVO (única fuente de verdad:
+# las usan la red de gestión, el cierre de tarea y la desambiguación de carrito)
+SEÑALES_PEDIDO_NUEVO = ("pedido nuevo", "otro pedido", "nuevo pedido", "empezar de cero",
+                        "arrancar otro", "distinto pedido", "hacer un pedido", "quiero pedir",
+                        "armar un pedido", "arrancar un pedido", "empezar un pedido",
+                        "realizar un pedido", "hacer otro")
+SEÑALES_CIERRE = ("chau", "nada mas", "nada más", "eso es todo", "listo gracias",
+                  "gracias nada", "no gracias")
+
+
+def prompt_agente_humano(cfg: dict) -> str:
+    """El cliente pidió hablar con una persona. Contener y derivar, marcando escalar."""
+    return f"""{_ctx_tenant(cfg)}
+
+El cliente pidió hablar con una PERSONA del equipo. Tu único rol en este turno:
+- Confirmale cálidamente que lo estás derivando con el equipo y que enseguida lo contactan.
+- NO intentes resolver su consulta vos, no ofrezcas productos, no hagas preguntas nuevas.
+- Mensaje corto, cálido, sin markdown.
+
+Respondé el texto y al final SIEMPRE este bloque:
+---JSON---
+{{"escalar": true}}
+---FIN---"""
+
 
 async def _interpretar_desambiguacion(cfg: dict, mensaje: str) -> str:
     """Decide si el cliente quiere 'sumar' al pedido de hoy o armar uno 'nuevo'.
@@ -1626,6 +1784,13 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str, modo: str =
     carrito_previo = conv["pedido"] if isinstance(conv["pedido"], list) else []
     hay_carrito = len(carrito_previo) > 0
 
+    # ── FLUJO VENDEDOR (definido acá arriba porque los interceptores lo usan) ──
+    # El rol viene EXCLUSIVAMENTE del campo de ManyChat (nunca del texto del chat).
+    es_vendedor = (rol == "vendedor")
+    cliente_rep = conv.get("cliente_representado") if es_vendedor else None
+    if es_vendedor:
+        print(f"[VENDEDOR] activo | cliente_rep={cliente_rep}")
+
     # ── INTERCEPTOR DE FEEDBACK (botones 👍/👎, cero llamadas al modelo) ──
     m_fb = (mensaje or "").strip()
     if m_fb.startswith("👍") or m_fb == FEEDBACK_POS:
@@ -1635,7 +1800,11 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str, modo: str =
         await upsert_conversacion(tenant_id, contact_id, {"historial": historial})
         await guardar_log(tenant_id, contact_id, "feedback", mensaje, texto)
         print("[FEEDBACK] positivo 👍")
-        return "charla", ("" if modo != "auto" else texto), {}, ""
+        if modo != "auto":
+            # cortesía automática: no necesita validación del operador
+            await manychat_enviar_texto(tenant.get("manychat_token", MANYCHAT_API_KEY), contact_id, texto)
+            return "charla", "", {}, ""
+        return "charla", texto, {}, ""
     if m_fb.startswith("👎") or m_fb == FEEDBACK_NEG:
         texto = "Uy, lamento que no haya sido lo que esperabas 🙏 ¿En qué puedo mejorar? Tu comentario nos sirve muchísimo."
         historial.append({"role": "user", "content": mensaje})
@@ -1643,7 +1812,57 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str, modo: str =
         await upsert_conversacion(tenant_id, contact_id, {"historial": historial})
         await guardar_log(tenant_id, contact_id, "feedback", mensaje, texto)
         print("[FEEDBACK] negativo 👎")
-        return "charla", ("" if modo != "auto" else texto), {}, ""
+        if modo != "auto":
+            await manychat_enviar_texto(tenant.get("manychat_token", MANYCHAT_API_KEY), contact_id, texto)
+            return "charla", "", {}, ""
+        return "charla", texto, {}, ""
+
+    # ── INTERCEPTOR "LO DE SIEMPRE" (2.4): vuelca el pedido habitual del cliente al carrito ──
+    m_ds = _norm_nombre(mensaje)
+    FRASES_DE_SIEMPRE = ("lo de siempre", "el de siempre", "lo mismo de siempre", "mi pedido de siempre",
+                         "pedido de siempre", "lo mismo de la otra vez", "lo mismo del otro dia",
+                         "repetime el pedido", "repetime el ultimo", "lo mismo que la ultima vez",
+                         "el mismo pedido de siempre")
+    if any(f in m_ds for f in FRASES_DE_SIEMPRE):
+        cid_stats = cliente_rep.get("contact_id") if (es_vendedor and isinstance(cliente_rep, dict)) else None
+        if es_vendedor and not cid_stats:
+            pass  # vendedor sin cliente resuelto: sigue el flujo normal (pedirá el cliente)
+        else:
+            stats = await cpm_contact_stats(tenant_id, contact_id=cid_stats,
+                                            manychat_contact_id=None if cid_stats else contact_id)
+            base = stats.get("pedido_frecuente") or stats.get("pedido_ultimo") or []
+            if base:
+                carrito_previo = [{
+                    "product_id": it.get("product_id"),
+                    "variant_id": it.get("variant_id"),
+                    "product_name": it.get("product_name", ""),
+                    "precio": float(it.get("unit_price", 0) or 0),
+                    "cantidad": int(it.get("quantity", 1) or 1),
+                    "sale_unit": it.get("sale_unit", "bulto") or "bulto",
+                    "is_promo": False,
+                } for it in base if it.get("variant_id")]
+                detalle = "\n".join(f"• {c['cantidad']}x {c['product_name']}" for c in carrito_previo)
+                total_ds = sum(c["precio"] * c["cantidad"] for c in carrito_previo)
+                texto = (f"¡Va lo de siempre! 😊\n{detalle}\n\nTotal: ${total_ds:,.0f}\n"
+                         f"¿Confirmás o cambio algo?")
+                historial.append({"role": "user", "content": mensaje})
+                if modo == "copilot":
+                    historial.append({"role": "assistant", "content": f"{MARCA_SUGERENCIA}{texto}"})
+                else:
+                    historial.append({"role": "assistant", "content": texto})
+                await upsert_conversacion(tenant_id, contact_id, {
+                    "historial": historial, "agente_activo": "pedido",
+                    "tarea_pendiente": "pedido", "pedido_en_curso": carrito_previo})
+                await guardar_log(tenant_id, contact_id, "pedido", mensaje, texto)
+                print(f"[LO-DE-SIEMPRE] volcados {len(carrito_previo)} items | total=${total_ds:,.0f}")
+                if modo == "copilot":
+                    await cpm_post_suggestions(tenant_id, contact_id, [texto])
+                    await cpm_post_draft_order(tenant_id, contact_id, carrito_previo)
+                    return "pedido", "", {}, ""
+                imagen_ds = await generar_imagen_pedido(tenant_id, cfg, carrito_previo)
+                return "pedido", texto, {}, imagen_ds
+            else:
+                print("[LO-DE-SIEMPRE] sin historial de pedidos en contact-stats — sigue flujo normal")
 
     ruta = await clasificar_ruta(cfg, historial, mensaje, tarea, hay_carrito)
 
@@ -1677,12 +1896,7 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str, modo: str =
     # Evita que "agregá un combo" o una cortesía ("perfecto") saquen del hilo de gestión.
     if tarea == "gestion" and agente in ("pedido", "asesor", "charla"):
         m_low = (mensaje or "").lower()
-        sale_de_gestion = any(k in m_low for k in [
-            "pedido nuevo", "otro pedido", "nuevo pedido", "empezar de cero",
-            "arrancar otro", "aparte", "por separado", "distinto pedido",
-            "hacer un pedido", "quiero pedir", "armar un pedido", "arrancar un pedido",
-            "empezar un pedido", "realizar un pedido", "hacer otro",
-            "chau", "nada mas", "nada más", "eso es todo", "listo gracias"])
+        sale_de_gestion = any(k in m_low for k in SEÑALES_PEDIDO_NUEVO + SEÑALES_CIERRE + ("aparte", "por separado"))
         # cortesías puras ("perfecto", "gracias", "ok") NO sacan de gestión: se quedan
         if not sale_de_gestion:
             print(f"[DIAG-GESTION] router dijo '{agente}' pero mantengo GESTION (venía gestionando)")
@@ -1696,15 +1910,43 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str, modo: str =
     ultimo_ped_num = conv.get("ultimo_pedido_num", "")
     hubo_pedido_hoy = (ultimo_ped_fecha == hoy_iso) and bool(ultimo_ped_num)
 
-    # ── FLUJO VENDEDOR ──
-    # El rol viene EXCLUSIVAMENTE del campo de ManyChat (nunca del texto del chat).
-    es_vendedor = (rol == "vendedor")
-    cliente_rep = conv.get("cliente_representado") if es_vendedor else None
+    # Vendedores: cargan varios pedidos por día para distintos clientes;
+    # la desambiguación "¿sumo al pedido de hoy?" no aplica.
     if es_vendedor:
-        # Los vendedores cargan varios pedidos por día para distintos clientes:
-        # la desambiguación "¿sumo al pedido de hoy?" no aplica.
         hubo_pedido_hoy = False
-        print(f"[VENDEDOR] activo | cliente_rep={cliente_rep}")
+
+    # ── DESAMBIGUACIÓN "carrito fantasma" ──
+    # El cliente arranca EXPLÍCITAMENTE un pedido ("quiero hacer un pedido") pero hay
+    # un carrito con productos de una conversación anterior (típico: copilot sin cerrar).
+    # NUNCA sumar en silencio sobre lo viejo: preguntar qué hacer con eso.
+    arranque_explicito = any(k in (mensaje or "").lower() for k in SEÑALES_PEDIDO_NUEVO)
+    if (agente == "pedido" and hay_carrito and arranque_explicito
+            and tarea not in ("desambiguar_pedido", "desambiguar_carrito")):
+        prods = ", ".join(f"{c['cantidad']}x {c['product_name']}" for c in carrito_previo)
+        historial.append({"role": "user", "content": mensaje})
+        texto = (f"¡Dale! Ojo que tenías estos productos sin confirmar de antes: {prods}. "
+                 f"¿Los mantengo en este pedido o arrancamos de cero?")
+        historial.append({"role": "assistant", "content": texto})
+        await upsert_conversacion(tenant_id, contact_id, {
+            "historial": historial, "agente_activo": "pedido",
+            "tarea_pendiente": "desambiguar_carrito", "pedido_en_curso": carrito_previo})
+        await guardar_log(tenant_id, contact_id, "pedido", mensaje, texto)
+        if modo == "copilot":
+            await cpm_post_suggestions(tenant_id, contact_id, [texto])
+            return "pedido", "", {}, ""
+        return "pedido", texto, {}, ""
+
+    # Respuesta a la pregunta del carrito fantasma
+    if tarea == "desambiguar_carrito":
+        m_low = _norm_nombre(mensaje)
+        if any(k in m_low for k in ("cero", "nuevo", "borra", "limpia", "saca", "descarta", "empeza", "olvida")):
+            carrito_previo = []
+            carrito = []
+            hay_carrito = False
+            print("[DIAG-CARRITO] cliente eligió arrancar de cero — carrito limpiado")
+        else:
+            print("[DIAG-CARRITO] cliente mantiene el carrito previo")
+        tarea = ""  # resuelto: sigue el flujo normal de pedido con lo elegido
 
     if agente == "pedido" and not hay_carrito and hubo_pedido_hoy and tarea != "desambiguar_pedido":
         # Interceptar: preguntar antes de armar carrito
@@ -2287,10 +2529,7 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str, modo: str =
     # Solo se cierra si el cliente arranca algo nuevo explícito o confirma cierre.
     if tarea == "gestion" and agente in ("gestion", "charla", "asesor"):
         m_low = (mensaje or "").lower()
-        cierra_gestion = any(k in m_low for k in [
-            "pedido nuevo", "otro pedido", "nuevo pedido", "chau", "nada mas", "nada más",
-            "hacer un pedido", "quiero pedir", "armar un pedido", "arrancar un pedido",
-            "listo gracias", "eso es todo", "gracias nada", "no gracias"])
+        cierra_gestion = any(k in m_low for k in SEÑALES_PEDIDO_NUEVO + SEÑALES_CIERRE)
         if not cierra_gestion:
             nueva_tarea = "gestion"
         # si cierra gestión, queda la tarea base del agente actual (pedido/asesor/"" según corresponda)
@@ -2312,16 +2551,46 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str, modo: str =
     # sugerencias al operador y se actualiza el borrador de pedido si cambió. ──
     if modo == "copilot":
         sugerencias = [texto] if texto else []
+        priority = None
+        priority_reason = None
+        followup = None
         if texto:
             lista_promos = await get_lista_liviana(tenant_id)
             ctx_pedido = ""
             if conv.get("ultimo_pedido_fecha") == datetime.utcnow().date().isoformat() and conv.get("ultimo_pedido_num"):
                 ctx_pedido = f"El cliente tiene el pedido N° {conv['ultimo_pedido_num']} abierto de hoy."
-            variantes = await generar_variantes_sugerencia(cfg, texto, mensaje,
-                                                           _promos_compactas(lista_promos), ctx_pedido)
-            sugerencias += variantes
-        if sugerencias:
-            await cpm_post_suggestions(tenant_id, contact_id, sugerencias[:2])
+            # Ficha comercial del cliente (2.2): contexto real para mejores sugerencias
+            cid_stats = cliente_rep.get("contact_id") if (es_vendedor and isinstance(cliente_rep, dict)) else None
+            stats = await cpm_contact_stats(tenant_id, contact_id=cid_stats,
+                                            manychat_contact_id=None if cid_stats else contact_id)
+            ficha = _ficha_cliente_txt(stats)
+            res_var = await generar_variantes_sugerencia(cfg, texto, mensaje,
+                                                         _promos_compactas(lista_promos), ctx_pedido, ficha)
+            if res_var.get("alternativa"):
+                sugerencias.append(res_var["alternativa"])
+            # Detector de urgencia (2.3): lo que dijo el modelo + refuerzo por keywords en código
+            m_urg = _norm_nombre(mensaje)
+            KEYWORDS_URGENCIA = ("reclamo", "queja", "nunca llego", "no llego el pedido", "urgente",
+                                 "ya mismo", "cansado de esperar", "harto", "una verguenza",
+                                 "no compro mas", "voy a cancelar todo", "estafa")
+            if res_var.get("urgencia") == "alta" or any(k in m_urg for k in KEYWORDS_URGENCIA):
+                priority = "alta"
+                priority_reason = res_var.get("motivo") or "Posible reclamo o urgencia detectada en el mensaje"
+            # Follow-up sugerido (2.5): el cliente pateó la decisión
+            FRASES_FOLLOWUP = ("lo pienso", "dejame pensarlo", "te confirmo", "manana te digo",
+                               "despues te digo", "despues veo", "mas tarde te aviso", "lo consulto")
+            if any(f in m_urg for f in FRASES_FOLLOWUP):
+                que = f" con {carrito[0]['product_name']}" if carrito else ""
+                followup = {
+                    "texto": (f"¡Hola! Te escribo por el pedido{que} que quedó pendiente ayer. "
+                              f"¿Lo avanzamos? Cualquier duda me decís 😊"),
+                    "sugerido_para": (datetime.utcnow() + timedelta(hours=24)).replace(
+                        microsecond=0).isoformat() + "Z",
+                }
+        if sugerencias or priority or followup:
+            await cpm_post_suggestions(tenant_id, contact_id, sugerencias[:2],
+                                       priority=priority, priority_reason=priority_reason,
+                                       followup=followup)
         # Draft: si gestión propuso cambios a un pedido existente, ese estado tiene prioridad;
         # si no, el carrito nuevo cuando cambió en este turno.
         carrito_cambio = json.dumps(carrito, sort_keys=True, default=str) != _snapshot_carrito
@@ -2329,7 +2598,8 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str, modo: str =
             await cpm_post_draft_order(tenant_id, contact_id, draft_gestion_copilot)
         elif carrito_cambio:
             await cpm_post_draft_order(tenant_id, contact_id, carrito)
-        print(f"[COPILOT] sugerencias={min(len(sugerencias),2)} | draft={'gestion' if draft_gestion_copilot is not None else ('carrito' if carrito_cambio else 'no')}")
+        print(f"[COPILOT] sugerencias={min(len(sugerencias),2)} | priority={priority or '-'} | "
+              f"followup={'sí' if followup else 'no'} | draft={'gestion' if draft_gestion_copilot is not None else ('carrito' if carrito_cambio else 'no')}")
         return agente, "", json_data, ""  # ManyChat no envía nada al contacto
 
     return agente, texto, json_data, imagen_url
@@ -2370,6 +2640,75 @@ async def _responder_segun_modo(modo: str, tenant_id: str, contact_id: str,
         resp = _respuesta_unificada(agente, texto, {}, transcripcion)
     resp["modo"] = modo
     return JSONResponse(resp)
+
+
+@app.post("/pedido-confirmado")
+async def pedido_confirmado(request: Request):
+    """El CPM avisa que el operador CONFIRMÓ un pedido (draft validado o pedido creado
+       desde el panel, en modo copilot/manual). El bot genera la imagen del resumen con
+       la plantilla de siempre y la envía al contacto por la API de ManyChat, y suma el
+       cierre al historial para mantener el hilo.
+       Body: { tenant_id, manychat_contact_id, order_id }
+       Auth: Bearer AGENT_API_SECRET."""
+    auth = request.headers.get("authorization", "")
+    if auth != f"Bearer {CPM_API_KEY}":
+        return JSONResponse({"ok": False, "error": "no autorizado"}, status_code=401)
+    body = await request.json()
+    tenant_id = str(body.get("tenant_id", "") or "").strip()
+    contact_id = str(body.get("manychat_contact_id", "") or "").strip()
+    order_id = str(body.get("order_id", "") or "").strip()
+    if not tenant_id or not contact_id or not order_id:
+        return JSONResponse({"ok": False, "error": "faltan tenant_id, manychat_contact_id u order_id"}, status_code=400)
+    try:
+        ped = await cpm_consultar_pedido(tenant_id, order_id)
+        items = (ped.get("items") if isinstance(ped, dict) else None) or []
+        items_img = _items_cpm_a_imagen(items)
+        num = ped.get("order_number", "") if isinstance(ped, dict) else ""
+        total = ped.get("total") if isinstance(ped, dict) else None
+        if total is None and items_img:
+            total = sum(it["precio"] * it["cantidad"] for it in items_img)
+        cfg = {"settings": {}, "name": "", "slug": ""}
+        # config real del tenant para la plantilla (logo, nombre)
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.get(f"{SUPABASE_URL}/rest/v1/tenants", headers=_headers(),
+                                     params={"id": f"eq.{tenant_id}", "select": "name,slug,settings"})
+            tdata = r.json()
+            if isinstance(tdata, list) and tdata:
+                cfg = {"name": tdata[0].get("name", ""), "slug": tdata[0].get("slug", ""),
+                       "settings": tdata[0].get("settings") or {}}
+        except Exception:
+            pass
+        imagen_url = await generar_imagen_pedido(tenant_id, cfg, items_img) if items_img else ""
+        caption = f"✅ ¡Pedido{f' N° {num}' if num else ''} confirmado!"
+        if total is not None:
+            caption += f" Total: ${float(total):,.0f}."
+        caption += " ¡Gracias!"
+        token = await get_token_manychat_por_tenant(tenant_id)
+        enviado = False
+        if imagen_url:
+            enviado = await manychat_enviar_imagen(token, contact_id, imagen_url, caption)
+        # Mantener el hilo: registrar el cierre en el historial
+        try:
+            conv = await get_conversacion(tenant_id, contact_id)
+            historial = conv["historial"]
+            historial.append({"role": "assistant", "content": caption})
+            if len(historial) > 40:
+                historial = historial[-40:]
+            await upsert_conversacion(tenant_id, contact_id, {
+                "historial": historial, "pedido_en_curso": [], "tarea_pendiente": "",
+                "ultimo_pedido_fecha": datetime.utcnow().date().isoformat(),
+                "ultimo_pedido_num": str(num)})
+        except Exception as e:
+            print(f"[PEDIDO-CONFIRMADO] historial no actualizado: {e}")
+        # Encuesta de satisfacción también en copilot/manual: la experiencia existió igual.
+        await manychat_enviar_botones(token, contact_id,
+            "¿Qué te pareció la atención para hacer tu pedido?", [FEEDBACK_POS, FEEDBACK_NEG])
+        print(f"[PEDIDO-CONFIRMADO] N° {num} | imagen={'enviada' if enviado else 'NO enviada'} | encuesta=enviada | url={imagen_url[:60]}")
+        return JSONResponse({"ok": True, "imagen_enviada": enviado, "imagen_url": imagen_url})
+    except Exception as e:
+        print(f"[PEDIDO-CONFIRMADO] error: {e}")
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
 
 @app.post("/operador-mensaje")
