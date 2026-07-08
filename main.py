@@ -90,6 +90,7 @@ async def resolver_tenant(page_id: str) -> dict:
             "slug": t.get("slug", ""),
             "settings": t.get("settings") or {},
             "manychat_token": manychat_token,
+            "page_id": page_id,
         }
 
     _tenant_cache[page_id] = {"ts": ahora, "data": data}
@@ -194,7 +195,7 @@ async def guardar_log(tenant_id: str, contact_id: str, agente: str, mensaje: str
 
 # Cache de catálogo del CPM por tenant. TTL corto porque promos/stock cambian.
 _catalogo_cache = {}
-CAT_TTL = 60
+CAT_TTL = 180
 
 
 async def cpm_get_catalogo(tenant_id: str) -> list:
@@ -1012,6 +1013,31 @@ async def manychat_enviar_botones(token: str, subscriber_id: str, texto: str, ca
     except Exception as e:
         print(f"[manychat_botones] excepción: {e}")
         return False
+
+
+async def imagen_pedido_background(tenant_id: str, cfg: dict, items: list, token: str,
+                                   subscriber_id: str, page_id: str = "", delivery: str = ""):
+    """Genera la imagen del pedido y la envía FUERA del request (background):
+       1) al contacto por la API de ManyChat, 2) al inbox del CPM vía su webhook.
+       Saca ~2-4s del camino crítico: la respuesta de texto no espera a la imagen."""
+    try:
+        url = await generar_imagen_pedido(tenant_id, cfg, items, delivery)
+        if not url:
+            print("[IMG-BG] no se generó imagen")
+            return
+        ok = await manychat_enviar_imagen(token, subscriber_id, url)
+        # Notificar al inbox del CPM para que la imagen quede en la conversación
+        try:
+            base_cpm = CPM_API_URL.replace("/api/agent", "")
+            async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+                await client.post(f"{base_cpm}/api/webhooks/manychat",
+                                  json={"page_id": page_id, "contact_id": subscriber_id,
+                                        "image_url": url, "text": "", "sender": "bot"})
+        except Exception as e:
+            print(f"[IMG-BG] webhook CPM falló (no crítico): {e}")
+        print(f"[IMG-BG] imagen {'enviada' if ok else 'FALLÓ envío'} → {url[:60]}")
+    except Exception as e:
+        print(f"[IMG-BG] excepción: {e}")
 
 
 async def manychat_enviar_texto(token: str, subscriber_id: str, texto: str) -> bool:
@@ -1859,8 +1885,11 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str, modo: str =
                     await cpm_post_suggestions(tenant_id, contact_id, [texto])
                     await cpm_post_draft_order(tenant_id, contact_id, carrito_previo)
                     return "pedido", "", {}, ""
-                imagen_ds = await generar_imagen_pedido(tenant_id, cfg, carrito_previo)
-                return "pedido", texto, {}, imagen_ds
+                asyncio.create_task(imagen_pedido_background(
+                    tenant_id, cfg, list(carrito_previo),
+                    tenant.get("manychat_token", MANYCHAT_API_KEY), contact_id,
+                    tenant.get("page_id", "")))
+                return "pedido", texto, {}, ""
             else:
                 print("[LO-DE-SIEMPRE] sin historial de pedidos en contact-stats — sigue flujo normal")
 
@@ -2211,13 +2240,14 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str, modo: str =
         pidio_resumen = accion == "resumen"
         print(f"[DIAG-IMG] cambio={cambio} | pidio_resumen={pidio_resumen} | items={len(carrito)}")
         if carrito and not pedido_registrado and (cambio or pidio_resumen) and modo != "copilot":
-            from datetime import timedelta
             delivery = (datetime.utcnow() + timedelta(days=1)).date().strftime("%d/%m/%Y")
-            imagen_url = await generar_imagen_pedido(tenant_id, cfg, carrito, delivery)
-            print(f"[DIAG-IMG] imagen_url='{imagen_url}'")
-            if not imagen_url:
-                # respaldo: si falla la imagen, mostramos la tabla de texto
-                texto += "\n\n" + formato_tabla_pedido(carrito)
+            # La imagen se genera y envía en BACKGROUND: no bloquea la respuesta de texto
+            # (ManyChat corta el request a los ~10s; la imagen sola son 2-4s).
+            asyncio.create_task(imagen_pedido_background(
+                tenant_id, cfg, list(carrito),
+                tenant.get("manychat_token", MANYCHAT_API_KEY), contact_id,
+                tenant.get("page_id", ""), delivery=delivery))
+            print(f"[DIAG-IMG] imagen → background (no bloquea la respuesta)")
     elif agente == "gestion":
         # Gestión de pedidos YA confirmados: consultar estado, modificar (agregar/quitar/cambiar, solo pendiente), cancelar.
         if es_vendedor and not (isinstance(cliente_rep, dict) and cliente_rep.get("contact_id")):
@@ -2464,8 +2494,11 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str, modo: str =
                             texto = f"{base}\n\nQueda así:\n{detalle}"
                             if total_act is not None:
                                 texto += f"\n\nTotal: ${float(total_act):,.0f}"
-                            imagen_url = await generar_imagen_pedido(tenant_id, cfg, items_img)
-                            print(f"[DIAG-GESTION] imagen actualizada='{imagen_url}' | total={total_act}")
+                            asyncio.create_task(imagen_pedido_background(
+                                tenant_id, cfg, list(items_img),
+                                tenant.get("manychat_token", MANYCHAT_API_KEY), contact_id,
+                                tenant.get("page_id", "")))
+                            print(f"[DIAG-GESTION] imagen → background | total={total_act}")
                     else:
                         if res_edit.get("error"):
                             # Error de NEGOCIO (sin cupo de promo, no fraccionable, sin stock):
@@ -2777,10 +2810,10 @@ async def orquestador(request: Request):
     if not tenant:
         return JSONResponse(_respuesta_unificada("charla", "No encontré la configuración de este negocio. Avisá al administrador.", {}))
 
-    # Modo de la conversación (auto/copilot/manual). Se consulta ANTES de cada
-    # mensaje porque el operador puede cambiarlo en vivo desde el inbox.
-    modo = await cpm_get_modo(tenant["tenant_id"], contact_id)
-    print(f"[MODO] {modo}")
+    # Modo de la conversación (auto/copilot/manual). Se lanza como TASK para que corra
+    # en paralelo con el procesamiento del mensaje (ej. transcripción de audio) y no
+    # sume latencia en serie. Se espera recién donde se necesita.
+    task_modo = asyncio.create_task(cpm_get_modo(tenant["tenant_id"], contact_id))
 
     transcripcion = ""  # se llena solo si el mensaje fue un audio
 
@@ -2818,7 +2851,7 @@ async def orquestador(request: Request):
     if tipo_media == "audio":
         transcripto = await transcribir_audio(url_media)
         if not transcripto:
-            return await _responder_segun_modo(modo, tenant["tenant_id"], contact_id, "charla",
+            return await _responder_segun_modo(await task_modo, tenant["tenant_id"], contact_id, "charla",
                 "No pude escuchar bien el audio 🙉 ¿me lo escribís o lo mandás de nuevo?")
         mensaje = transcripto
         transcripcion = transcripto
@@ -2830,16 +2863,19 @@ async def orquestador(request: Request):
             partes = [f"{it.get('cantidad', 1)} x {it.get('producto', '')}" for it in resultado["items"]]
             mensaje = "Quiero pedir lo de esta imagen: " + ", ".join(partes)
         elif resultado["tipo"] == "descripcion":
-            return await _responder_segun_modo(modo, tenant["tenant_id"], contact_id, "charla",
+            return await _responder_segun_modo(await task_modo, tenant["tenant_id"], contact_id, "charla",
                 f"Vi tu imagen: {resultado['texto']}. ¿Querés que te arme un pedido con algo de esto? Contame qué necesitás.")
         else:
-            return await _responder_segun_modo(modo, tenant["tenant_id"], contact_id, "charla",
+            return await _responder_segun_modo(await task_modo, tenant["tenant_id"], contact_id, "charla",
                 "No pude abrir bien la imagen. ¿Me la mandás de nuevo o me escribís qué necesitás?")
 
     # 'transcripcion' siempre lleva el mensaje del cliente EN TEXTO:
     # si fue audio, ya tiene la transcripción; si no, usamos el texto/mensaje resuelto.
     if not transcripcion:
         transcripcion = mensaje
+
+    modo = await task_modo
+    print(f"[MODO] {modo}")
 
     # MODO MANUAL: el humano atiende solo. Cero llamadas al modelo.
     # Solo guardamos el mensaje en el historial (para que el bot tenga contexto
