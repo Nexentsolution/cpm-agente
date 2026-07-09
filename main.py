@@ -48,6 +48,36 @@ def _headers(extra: dict = None):
 # RESOLUCIÓN DE TENANT (corazón multi-tenant)
 # ─────────────────────────────────────────────
 
+_rol_cache = {}
+ROL_TTL = 600  # el rol de un contacto casi nunca cambia: 10 min de cache
+
+
+async def get_rol_interno(tenant_id: str, contact_id: str) -> str:
+    """ÚNICA fuente de verdad del rol: tabla usuarios_internos en Supabase.
+       Un vendedor se da de alta con un INSERT (tenant_id + contact_id de ManyChat).
+       Devuelve 'vendedor' si está activo, '' si es un cliente normal."""
+    clave = f"{tenant_id}:{contact_id}"
+    ahora = datetime.utcnow().timestamp()
+    c = _rol_cache.get(clave)
+    if c and (ahora - c["ts"]) < ROL_TTL:
+        return c["rol"]
+    rol = ""
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            r = await client.get(
+                f"{SUPABASE_URL}/rest/v1/usuarios_internos",
+                headers=_headers(),
+                params={"tenant_id": f"eq.{tenant_id}", "contact_id": f"eq.{contact_id}",
+                        "activo": "eq.true", "select": "rol", "limit": "1"})
+        data = r.json()
+        if isinstance(data, list) and data:
+            rol = str(data[0].get("rol", "") or "").strip().lower()
+    except Exception as e:
+        print(f"[get_rol_interno] excepción (se asume cliente): {e}")
+    _rol_cache[clave] = {"ts": ahora, "rol": rol}
+    return rol
+
+
 async def resolver_tenant(page_id: str) -> dict:
     """Dado el manychat_page_id, devuelve {tenant_id, settings} del tenant dueño.
     Usa cache en memoria con TTL. Devuelve None si no se encuentra."""
@@ -1015,6 +1045,61 @@ async def manychat_enviar_botones(token: str, subscriber_id: str, texto: str, ca
         return False
 
 
+async def procesar_audio_background(tenant: dict, contact_id: str, url_media: str,
+                                    task_modo, task_rol):
+    """AUDIO 100% en background: la ventana de ~10s de ManyChat hace imposible
+       transcribir + procesar + responder dentro del request (8-28s reales).
+       El endpoint ya respondió vacío; acá se transcribe, se corre el turno completo
+       y la respuesta viaja por la API de ManyChat. La transcripción completa se
+       publica también en el inbox del CPM."""
+    tenant_id = tenant["tenant_id"]
+    token = tenant.get("manychat_token", MANYCHAT_API_KEY)
+    page_id = tenant.get("page_id", "")
+    try:
+        modo = await task_modo
+        rol = await task_rol
+        transcripto = await transcribir_audio(url_media)
+        if not transcripto:
+            aviso = "No pude escuchar bien el audio 🙉 ¿me lo escribís o lo mandás de nuevo?"
+            if modo == "auto":
+                await manychat_enviar_texto(token, contact_id, aviso)
+            elif modo == "copilot":
+                await cpm_post_suggestions(tenant_id, contact_id, [aviso])
+            return
+        # Transcripción completa al inbox del CPM (se ve junto al audio del contacto)
+        try:
+            base_cpm = CPM_API_URL.replace("/api/agent", "")
+            async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+                await client.post(f"{base_cpm}/api/webhooks/manychat",
+                                  json={"page_id": page_id, "contact_id": contact_id,
+                                        "text": f"🎙️ Transcripción: {transcripto}",
+                                        "sender": "contact"})
+        except Exception as e:
+            print(f"[AUDIO-BG] transcripción al inbox falló (no crítico): {e}")
+        if modo == "manual":
+            # solo dejar el mensaje en el historial del bot (contexto para cuando vuelva a auto/copilot)
+            try:
+                conv = await get_conversacion(tenant_id, contact_id)
+                historial = conv["historial"]
+                historial.append({"role": "user", "content": transcripto})
+                if len(historial) > 40:
+                    historial = historial[-40:]
+                await upsert_conversacion(tenant_id, contact_id, {"historial": historial})
+            except Exception as e:
+                print(f"[AUDIO-BG] historial manual: {e}")
+            print(f"[AUDIO-BG] manual: transcripto guardado ({len(transcripto)} chars)")
+            return
+        # auto / copilot: turno completo
+        agente, texto, json_data, _img = await manejar_turno(
+            tenant, contact_id, transcripto, modo=modo, rol=rol, fue_audio=True)
+        if modo == "auto" and texto:
+            await manychat_enviar_texto(token, contact_id, texto)
+        # copilot: manejar_turno ya posteó sugerencias/draft; no hay nada que enviar
+        print(f"[AUDIO-BG] completado | modo={modo} | agente={agente} | resp={len(texto or '')} chars")
+    except Exception as e:
+        print(f"[AUDIO-BG] excepción: {e}")
+
+
 async def imagen_pedido_background(tenant_id: str, cfg: dict, items: list, token: str,
                                    subscriber_id: str, page_id: str = "", delivery: str = ""):
     """Genera la imagen del pedido y la envía FUERA del request (background):
@@ -1172,7 +1257,7 @@ def _ficha_cliente_txt(stats: dict) -> str:
 
 async def cpm_post_suggestions(tenant_id: str, manychat_contact_id: str, suggestions: list,
                                priority: str = None, priority_reason: str = None,
-                               followup: dict = None) -> bool:
+                               followup: dict = None, nota: str = None) -> bool:
     """POST /suggestions — propuestas de respuesta para el operador (modo copilot).
        Máx 3. Cada tanda pisa las pendientes anteriores (lo maneja el CPM)."""
     try:
@@ -1185,6 +1270,8 @@ async def cpm_post_suggestions(tenant_id: str, manychat_contact_id: str, suggest
                     body["priority_reason"] = priority_reason[:120]
             if followup and isinstance(followup, dict) and followup.get("texto"):
                 body["followup"] = followup
+            if nota:
+                body["nota"] = nota[:200]
             r = await client.post(
                 f"{CPM_API_URL}/suggestions",
                 headers=_headers_cpm(),
@@ -1258,8 +1345,10 @@ async def generar_variantes_sugerencia(cfg: dict, texto_base: str, mensaje_clien
                   f"si el cliente quiere pedir y tiene un pedido abierto, un camino suma a ese pedido y el otro "
                   f"propone uno nuevo para no mezclar; si el camino 1 informa, el 2 avanza la conversación. "
                   f"Datos reales solamente (nunca inventes precios ni productos). Breve, tono WhatsApp argentino.\n"
-                  f"ADEMÁS evaluá el mensaje del cliente: si trae enojo, reclamo, urgencia real o riesgo de "
-                  f"perderlo, urgencia es \"alta\" (y motivo corto); si no, \"normal\".\n"
+                  f"ADEMÁS evaluá el mensaje del cliente: urgencia \"alta\" SOLO si hay enojo EXPLÍCITO, "
+                  f"un reclamo concreto (algo que salió mal) o amenaza de irse. Preguntas normales, apuro "
+                  f"por cerrar un pedido o negociación de precios NO son urgencia. ANTE LA DUDA: \"normal\". "
+                  f"Si es alta, motivo corto y concreto.\n"
                   f"Devolvé SOLO este JSON, sin nada más: "
                   f'{{"alternativa": "...", "urgencia": "alta|normal", "motivo": "..."}}')
         raw = await llamar_claude(prompt, [{"role": "user", "content": mensaje_cliente}], max_tokens=300)
@@ -1627,22 +1716,22 @@ def tipo_de_url(texto: str) -> str:
 
 async def transcribir_audio(audio_url: str) -> str:
     """Descarga el audio y lo transcribe con Whisper (OpenAI). Devuelve texto o None.
-       Timeouts CORTOS y separados: ManyChat corta el request a los ~10s, así que ante
-       S3/Whisper lentos preferimos fallar rápido y responder degradado a colgarnos."""
+       Corre SIEMPRE en background (fuera de la ventana de ManyChat), así que los
+       timeouts son holgados para audios largos, pero acotados para nunca colgar."""
     if not OPENAI_KEY:
         print("[transcribir_audio] falta OPENAI_KEY")
         return None
     t0 = datetime.utcnow().timestamp()
     print(f"[transcribir_audio] inicio")
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(6.0, connect=4.0)) as client:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0)) as client:
             ar = await client.get(audio_url)
         if ar.status_code != 200:
             print(f"[transcribir_audio] descarga falló status={ar.status_code} en {datetime.utcnow().timestamp()-t0:.1f}s")
             return None
         audio_bytes = ar.content
         print(f"[transcribir_audio] descargado {len(audio_bytes)} bytes en {datetime.utcnow().timestamp()-t0:.1f}s")
-        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=5.0)) as client:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=5.0)) as client:
             r = await client.post(
                 "https://api.openai.com/v1/audio/transcriptions",
                 headers={"Authorization": f"Bearer {OPENAI_KEY}"},
@@ -1742,6 +1831,10 @@ SEÑALES_PEDIDO_NUEVO = ("pedido nuevo", "otro pedido", "nuevo pedido", "empezar
                         "realizar un pedido", "hacer otro")
 SEÑALES_CIERRE = ("chau", "nada mas", "nada más", "eso es todo", "listo gracias",
                   "gracias nada", "no gracias")
+KEYWORDS_URGENCIA = ("reclamo", "queja", "nunca llego", "no llego el pedido", "urgente",
+                     "ya mismo", "cansado de esperar", "harto", "una verguenza",
+                     "no compro mas", "voy a cancelar todo", "estafa", "indignado",
+                     "pesimo servicio", "pesima atencion", "una porqueria")
 
 
 def prompt_agente_humano(cfg: dict) -> str:
@@ -1795,7 +1888,8 @@ async def clasificar_ruta(cfg: dict, historial: list, mensaje: str, tarea: str, 
     return ruta if ruta in RUTAS_VALIDAS else "CHARLA"
 
 
-async def manejar_turno(tenant: dict, contact_id: str, mensaje: str, modo: str = "auto", rol: str = ""):
+async def manejar_turno(tenant: dict, contact_id: str, mensaje: str, modo: str = "auto", rol: str = "",
+                        fue_audio: bool = False):
     tenant_id = tenant["tenant_id"]
     cfg = tenant["settings"]
     imagen_url = ""  # URL de imagen del resumen de pedido, si se genera
@@ -2011,6 +2105,7 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str, modo: str =
     carrito = carrito_previo
     _snapshot_carrito = json.dumps(carrito_previo, sort_keys=True, default=str)  # para detectar cambios (copilot)
     pedido_registrado = None
+    items_turno_audio = []  # items detectados en este turno (para la nota de audio al operador)
     draft_gestion_copilot = None  # estado propuesto del pedido en gestión (copilot), va al draft
     marca_pedido = None  # (fecha_iso, order_number) si se confirma un pedido en este turno
     gestion_completada = False  # True cuando gestión ejecutó una acción y cierra el hilo
@@ -2188,6 +2283,9 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str, modo: str =
             texto = texto_tmp
             if avisos:
                 texto += "\n\n" + "\n".join(avisos)
+            if encontrados:
+                items_turno_audio = [(p["product_name"], cants.get(p["product_name"], 1),
+                                      unidades.get(p["product_name"], "bulto")) for p in encontrados]
 
         elif accion == "confirmar":
             if not carrito:
@@ -2603,9 +2701,7 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str, modo: str =
                 sugerencias.append(res_var["alternativa"])
             # Detector de urgencia (2.3): lo que dijo el modelo + refuerzo por keywords en código
             m_urg = _norm_nombre(mensaje)
-            KEYWORDS_URGENCIA = ("reclamo", "queja", "nunca llego", "no llego el pedido", "urgente",
-                                 "ya mismo", "cansado de esperar", "harto", "una verguenza",
-                                 "no compro mas", "voy a cancelar todo", "estafa")
+            print(f"[URGENCIA] modelo={res_var.get('urgencia')} motivo='{res_var.get('motivo','')[:60]}' | keywords={any(k in m_urg for k in KEYWORDS_URGENCIA)}")
             if res_var.get("urgencia") == "alta" or any(k in m_urg for k in KEYWORDS_URGENCIA):
                 priority = "alta"
                 priority_reason = res_var.get("motivo") or "Posible reclamo o urgencia detectada en el mensaje"
@@ -2620,10 +2716,14 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str, modo: str =
                     "sugerido_para": (datetime.utcnow() + timedelta(hours=24)).replace(
                         microsecond=0).isoformat() + "Z",
                 }
-        if sugerencias or priority or followup:
+        nota = None
+        if fue_audio and items_turno_audio:
+            det = ", ".join(f"{c}x {n}" + (" (unidad)" if u == "unidad" else "") for n, c, u in items_turno_audio)
+            nota = f"🎙️ Del audio: pide {det}"
+        if sugerencias or priority or followup or nota:
             await cpm_post_suggestions(tenant_id, contact_id, sugerencias[:2],
                                        priority=priority, priority_reason=priority_reason,
-                                       followup=followup)
+                                       followup=followup, nota=nota)
         # Draft: si gestión propuso cambios a un pedido existente, ese estado tiene prioridad;
         # si no, el carrito nuevo cuando cambió en este turno.
         carrito_cambio = json.dumps(carrito, sort_keys=True, default=str) != _snapshot_carrito
@@ -2634,6 +2734,24 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str, modo: str =
         print(f"[COPILOT] sugerencias={min(len(sugerencias),2)} | priority={priority or '-'} | "
               f"followup={'sí' if followup else 'no'} | draft={'gestion' if draft_gestion_copilot is not None else ('carrito' if carrito_cambio else 'no')}")
         return agente, "", json_data, ""  # ManyChat no envía nada al contacto
+
+    # MODO AUTO: detector de urgencia por keywords (sin llamadas extra al modelo).
+    # Si el cliente expresa enojo/reclamo, la conversación sube a la pestaña Prioridad
+    # del inbox para que un humano la mire, aunque el bot la esté atendiendo.
+    m_urg_auto = _norm_nombre(mensaje)
+    if any(k in m_urg_auto for k in KEYWORDS_URGENCIA):
+        asyncio.create_task(cpm_post_suggestions(
+            tenant_id, contact_id, [],
+            priority="alta", priority_reason="Cliente molesto o con reclamo — revisar la conversación"))
+        print(f"[URGENCIA-AUTO] priority=alta enviada al CPM")
+
+    # MODO AUTO: el draft-order también se actualiza (en background) para que el panel
+    # del inbox muestre el pedido en curso en cualquier modo. Al confirmar, se limpia.
+    carrito_cambio_auto = json.dumps(carrito, sort_keys=True, default=str) != _snapshot_carrito
+    if carrito_cambio_auto or (pedido_registrado and pedido_registrado.get("ok")):
+        items_draft = [] if (pedido_registrado and pedido_registrado.get("ok")) else carrito
+        asyncio.create_task(cpm_post_draft_order(tenant_id, contact_id, items_draft))
+        print(f"[DRAFT-AUTO] {'limpiado (pedido confirmado)' if not items_draft else f'{len(items_draft)} items'} → background")
 
     return agente, texto, json_data, imagen_url
 
@@ -2673,6 +2791,50 @@ async def _responder_segun_modo(modo: str, tenant_id: str, contact_id: str,
         resp = _respuesta_unificada(agente, texto, {}, transcripcion)
     resp["modo"] = modo
     return JSONResponse(resp)
+
+
+@app.post("/resumen-conversacion")
+async def resumen_conversacion(request: Request):
+    """Resumen ejecutivo para el operador (2.1). El CPM puede mandar los mensajes del
+       rango de fechas elegido (él tiene los timestamps); si no los manda, el bot
+       resume su propio historial (últimos 40 turnos).
+       Body: { tenant_id, manychat_contact_id, mensajes?: [{sender, text, fecha?}] }
+       Respuesta: { ok, resumen }. Auth: Bearer AGENT_API_SECRET."""
+    auth = request.headers.get("authorization", "")
+    if auth != f"Bearer {CPM_API_KEY}":
+        return JSONResponse({"ok": False, "error": "no autorizado"}, status_code=401)
+    body = await request.json()
+    tenant_id = str(body.get("tenant_id", "") or "").strip()
+    contact_id = str(body.get("manychat_contact_id", "") or "").strip()
+    if not tenant_id or not contact_id:
+        return JSONResponse({"ok": False, "error": "faltan tenant_id o manychat_contact_id"}, status_code=400)
+    try:
+        mensajes = body.get("mensajes") or []
+        if mensajes and isinstance(mensajes, list):
+            lineas = []
+            for m in mensajes[-60:]:
+                quien = "Cliente" if (m.get("sender") == "contact") else "Nosotros"
+                lineas.append(f"{quien}: {str(m.get('text', ''))[:300]}")
+            convo_txt = "\n".join(lineas)
+        else:
+            conv = await get_conversacion(tenant_id, contact_id)
+            lineas = []
+            for h in conv["historial"][-40:]:
+                quien = "Cliente" if h.get("role") == "user" else "Nosotros"
+                contenido = str(h.get("content", "")).replace(MARCA_SUGERENCIA, "")
+                lineas.append(f"{quien}: {contenido[:300]}")
+            convo_txt = "\n".join(lineas)
+        if not convo_txt.strip():
+            return JSONResponse({"ok": True, "resumen": "Sin mensajes en el período."})
+        prompt = ("Sos el asistente de un operador que va a tomar el control de una conversación "
+                  "de WhatsApp de una distribuidora. Resumila en 3 a 5 líneas, en español rioplatense, "
+                  "cubriendo: (1) qué quiere o pidió el cliente, (2) en qué quedaron / estado del pedido "
+                  "si hay, (3) algo pendiente o a tener en cuenta. Sin saludos ni relleno, directo al grano.")
+        resumen = await llamar_claude(prompt, [{"role": "user", "content": convo_txt}], max_tokens=300)
+        return JSONResponse({"ok": True, "resumen": (resumen or "").strip()})
+    except Exception as e:
+        print(f"[RESUMEN] error: {e}")
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
 
 @app.post("/pedido-confirmado")
@@ -2790,11 +2952,6 @@ async def orquestador(request: Request):
     contact_id = str(body.get("contact_id", "")).strip()
     mensaje = body.get("mensaje_usuario", "") or ""
     mensaje_audio = (body.get("mensaje_audio", "") or "").strip()
-    # Rol del contacto (custom field de ManyChat). Solo "vendedor" activa el flujo vendedor.
-    # NUNCA se acepta cambio de rol por texto del chat — solo este campo.
-    rol = str(body.get("rol", "") or "").strip().lower()
-    if rol in ("none", "null", "-", "n/a", "na", "vacio", "vacío"):
-        rol = ""
 
     # ManyChat no deja vaciar un campo desde la UI; usamos un valor centinela.
     # Si mensaje_audio trae un marcador (none, vacio, -, etc.), lo tratamos como "sin audio".
@@ -2814,6 +2971,8 @@ async def orquestador(request: Request):
     # en paralelo con el procesamiento del mensaje (ej. transcripción de audio) y no
     # sume latencia en serie. Se espera recién donde se necesita.
     task_modo = asyncio.create_task(cpm_get_modo(tenant["tenant_id"], contact_id))
+    # Rol del contacto: ÚNICA fuente = tabla usuarios_internos (SQL). En paralelo, cacheado.
+    task_rol = asyncio.create_task(get_rol_interno(tenant["tenant_id"], contact_id))
 
     transcripcion = ""  # se llena solo si el mensaje fue un audio
 
@@ -2849,12 +3008,14 @@ async def orquestador(request: Request):
     print(f"[DIAG] url_media='{url_media[:60]}' | tipo_media='{tipo_media}'")
 
     if tipo_media == "audio":
-        transcripto = await transcribir_audio(url_media)
-        if not transcripto:
-            return await _responder_segun_modo(await task_modo, tenant["tenant_id"], contact_id, "charla",
-                "No pude escuchar bien el audio 🙉 ¿me lo escribís o lo mandás de nuevo?")
-        mensaje = transcripto
-        transcripcion = transcripto
+        # AUDIO → TODO EN BACKGROUND. El request de ManyChat (~10s) no alcanza para
+        # descarga + Whisper + pipeline (8-28s reales). Se responde YA (vacío) y la
+        # respuesta real viaja por la API de ManyChat cuando está lista.
+        asyncio.create_task(procesar_audio_background(tenant, contact_id, url_media, task_modo, task_rol))
+        resp = _respuesta_unificada("audio", "", {}, "")
+        resp["modo"] = "async"
+        print("[AUDIO] procesamiento lanzado en background — respuesta inmediata al flow")
+        return JSONResponse(resp)
 
     elif tipo_media == "imagen":
         lista = await get_lista_liviana(tenant["tenant_id"])
@@ -2875,7 +3036,8 @@ async def orquestador(request: Request):
         transcripcion = mensaje
 
     modo = await task_modo
-    print(f"[MODO] {modo}")
+    rol = await task_rol
+    print(f"[MODO] {modo} | rol='{rol}'")
 
     # MODO MANUAL: el humano atiende solo. Cero llamadas al modelo.
     # Solo guardamos el mensaje en el historial (para que el bot tenga contexto
@@ -2894,7 +3056,8 @@ async def orquestador(request: Request):
         resp["modo"] = "manual"
         return JSONResponse(resp)
 
-    agente, texto, json_data, imagen_url = await manejar_turno(tenant, contact_id, mensaje, modo=modo, rol=rol)
+    agente, texto, json_data, imagen_url = await manejar_turno(tenant, contact_id, mensaje, modo=modo, rol=rol,
+                                                               fue_audio=(tipo_media == "audio"))
     if texto is None:
         return await _responder_segun_modo(modo, tenant["tenant_id"], contact_id, "charla",
             "Tardé más de lo esperado. ¿Podés repetir tu mensaje?", transcripcion)
