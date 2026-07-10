@@ -5,6 +5,7 @@ import httpx
 import os
 import json
 import asyncio
+import re
 from datetime import datetime, timedelta
 
 app = FastAPI()
@@ -131,11 +132,12 @@ async def resolver_tenant(page_id: str) -> dict:
 # SUPABASE — conversaciones (con tenant_id)
 # ─────────────────────────────────────────────
 
-COLS_CONV_FULL = "historial,agente_activo,tarea_pendiente,pedido_en_curso,direccion_entrega,ultimo_pedido_fecha,ultimo_pedido_num,cliente_representado"
+COLS_CONV_FULL = "historial,agente_activo,tarea_pendiente,pedido_en_curso,direccion_entrega,ultimo_pedido_fecha,ultimo_pedido_num,cliente_representado,carrito_actualizado_en"
 COLS_CONV_BASE = "historial,agente_activo,tarea_pendiente,pedido_en_curso,direccion_entrega"
 
 _CONV_DEFAULT = {"historial": [], "agente_activo": "none", "tarea": "", "pedido": [], "direccion": "",
-                 "ultimo_pedido_fecha": "", "ultimo_pedido_num": "", "cliente_representado": None}
+                 "ultimo_pedido_fecha": "", "ultimo_pedido_num": "", "cliente_representado": None,
+                 "carrito_actualizado_en": ""}
 
 
 async def get_conversacion(tenant_id: str, contact_id: str) -> dict:
@@ -164,6 +166,7 @@ async def get_conversacion(tenant_id: str, contact_id: str) -> dict:
                     "ultimo_pedido_fecha": d.get("ultimo_pedido_fecha") or "",
                     "ultimo_pedido_num": d.get("ultimo_pedido_num") or "",
                     "cliente_representado": d.get("cliente_representado"),
+                    "carrito_actualizado_en": d.get("carrito_actualizado_en") or "",
                 }
             # data no es lista → error de PostgREST (ej. columna inexistente). VISIBLE y reintento base.
             print(f"[get_conversacion] ⚠️ ERROR del SELECT (status={r.status_code}): {str(data)[:300]}")
@@ -1964,11 +1967,15 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str, modo: str =
     # ── INTERCEPTOR LIMPIAR CARRITO (funciona en cualquier estado/agente) ──
     # BUG testeo 9/jul: el bot dijo "no puedo limpiar el carrito". SIEMPRE puede.
     FRASES_LIMPIAR = ("limpia el carrito", "limpiar el carrito", "vacia el carrito", "vaciar el carrito",
-                      "borra el carrito", "borra todo", "arranquemos de cero", "arrancamos de cero",
-                      "arranca de cero", "empecemos de nuevo", "empezamos de nuevo", "empeza de nuevo",
-                      "olvidate de todo", "borron y cuenta nueva", "resetea el carrito", "cancelalo todo")
+                      "borra el carrito", "borralo todo", "borra todo", "borrame el carrito",
+                      "arranquemos de cero", "arrancamos de cero", "arranca de cero", "arrancar de cero",
+                      "empecemos de nuevo", "empezamos de nuevo", "empeza de nuevo", "empezar de cero",
+                      "olvidate de todo", "borron y cuenta nueva", "resetea el carrito", "cancelalo todo",
+                      "limpialo", "vacialo", "sacame todo", "carrito nuevo", "sin lo anterior")
     m_lim = _norm_nombre(mensaje)
-    tiene_numero_pedido = any(ch.isdigit() for ch in mensaje or "") or "n°" in m_lim or "nro" in m_lim
+    # Solo un número DE PEDIDO explícito manda esto a gestión ("borra el pedido 1026").
+    # Un dígito suelto ("de cero, quiero 3 marinas") NO bloquea la limpieza (bug 10/jul).
+    tiene_numero_pedido = bool(re.search(r"(pedido|n°|nº|nro|numero|#)\s*\d+", m_lim))
     if any(f in m_lim for f in FRASES_LIMPIAR) and not tiene_numero_pedido:
         carrito_previo = []
         hay_carrito = False
@@ -2100,7 +2107,17 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str, modo: str =
     # un carrito con productos de una conversación anterior (típico: copilot sin cerrar).
     # NUNCA sumar en silencio sobre lo viejo: preguntar qué hacer con eso.
     arranque_explicito = any(k in (mensaje or "").lower() for k in SEÑALES_PEDIDO_NUEVO)
-    if (agente == "pedido" and hay_carrito and (arranque_explicito or venia_de_gestion)
+    # Carrito con más de 24hs sin actividad = carrito de OTRA conversación:
+    # ante cualquier actividad de pedido, preguntar antes de sumar encima.
+    carrito_viejo = False
+    try:
+        ts_carrito = conv.get("carrito_actualizado_en") or ""
+        if ts_carrito and hay_carrito:
+            ts = datetime.fromisoformat(str(ts_carrito).replace("Z", "+00:00")).replace(tzinfo=None)
+            carrito_viejo = (datetime.utcnow() - ts) > timedelta(hours=24)
+    except Exception:
+        pass
+    if (agente == "pedido" and hay_carrito and (arranque_explicito or venia_de_gestion or carrito_viejo)
             and tarea not in ("desambiguar_pedido", "desambiguar_carrito")):
         prods = ", ".join(f"{c['cantidad']}x {c['product_name']}" for c in carrito_previo)
         historial.append({"role": "user", "content": mensaje})
@@ -2223,6 +2240,12 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str, modo: str =
                 else:
                     texto_tmp = "No pude crear el cliente en el sistema. Probá de nuevo o avisá al equipo."
                     accion = "nada"
+            elif cq and (isinstance(cliente_rep, dict) and cliente_rep.get("contact_id")
+                         and (_norm_nombre(cq) in _norm_nombre(cliente_rep.get("nombre", ""))
+                              or _norm_nombre(cliente_rep.get("nombre", "")) in _norm_nombre(cq))):
+                # El modelo RE-EMITE el cliente ya asignado: NO re-resolver (evita que un
+                # resolve con candidatos pise la asignación hecha — bug "me pidió los datos")
+                print(f"[VENDEDOR] cliente_query '{cq}' coincide con el asignado ({cliente_rep.get('nombre')}) — ignorado")
             elif cq:
                 # ¿Hay candidatos pendientes? Resolver localmente por número o nombre
                 cands = cliente_rep.get("candidatos") if isinstance(cliente_rep, dict) else None
@@ -2239,6 +2262,15 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str, modo: str =
                     print(f"[VENDEDOR] cliente elegido de candidatos: {cliente_rep}")
                 else:
                     res_c = await cpm_resolver_contacto(tenant_id, query=cq)
+                    # Query multi-palabra sin match ("manuel el del kiosco"): reintentar
+                    # por palabras significativas antes de rendirse y pedir los 4 datos
+                    if not (res_c.get("ok") and (res_c.get("contact_id") or res_c.get("candidates"))):
+                        palabras = [p for p in _norm_nombre(cq).split() if len(p) > 3][:3]
+                        for p in palabras:
+                            print(f"[VENDEDOR] resolve '{cq}' sin match — reintento con '{p}'")
+                            res_c = await cpm_resolver_contacto(tenant_id, query=p)
+                            if res_c.get("ok") and (res_c.get("contact_id") or res_c.get("candidates")):
+                                break
                     if res_c.get("ok") and res_c.get("contact_id"):
                         cliente_rep = {"contact_id": res_c["contact_id"], "nombre": res_c.get("nombre", cq)}
                         print(f"[VENDEDOR] cliente resuelto: {cliente_rep}")
@@ -2736,6 +2768,12 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str, modo: str =
 
     # Persistir (incluye carrito actualizado)
     nueva_tarea = agente if agente in AGENTES_CONTENIDO else ""
+    # La derivación a humano es de UN SOLO turno: avisa al panel y queda libre.
+    # Si quedara pegada como tarea, TODOS los turnos siguientes caerían en el prompt
+    # de derivación ("no resuelvas nada") y el bot dejaría de entender pedidos
+    # y de anotar el draft en copiloto (bug del testeo 10/jul).
+    if agente == "agente_humano":
+        nueva_tarea = ""
     # si se registró el pedido, ya no hay tarea de pedido pendiente
     if pedido_registrado:
         nueva_tarea = ""
@@ -2767,6 +2805,10 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str, modo: str =
     await upsert_conversacion(tenant_id, contact_id, campos_persist)
     await guardar_log(tenant_id, contact_id, agente, mensaje, texto)
 
+    # Escalada a humano: el CPM debe enterarse SIEMPRE (pestaña Prioridad + sugerencia
+    # de saludo; {nombre} lo sustituye el CPM por el nombre del operador logueado).
+    escalada_humano = (agente == "agente_humano" and (json_data or {}).get("escalar"))
+
     # ── MODO COPILOT: el contacto NO recibe respuesta del bot. Se entregan
     # sugerencias al operador y se actualiza el borrador de pedido si cambió. ──
     if modo == "copilot":
@@ -2791,7 +2833,11 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str, modo: str =
             # Detector de urgencia (2.3): lo que dijo el modelo + refuerzo por keywords en código
             m_urg = _norm_nombre(mensaje)
             print(f"[URGENCIA] modelo={res_var.get('urgencia')} motivo='{res_var.get('motivo','')[:60]}' | keywords={any(k in m_urg for k in KEYWORDS_URGENCIA)}")
-            if res_var.get("urgencia") == "alta" or any(k in m_urg for k in KEYWORDS_URGENCIA):
+            if escalada_humano:
+                sugerencias.insert(0, "Hola, soy {nombre} 👋 Ya estoy con tu consulta, ¿en qué te puedo ayudar?")
+                priority = "alta"
+                priority_reason = "El cliente pidió hablar con una persona — tomar la conversación"
+            if not escalada_humano and (res_var.get("urgencia") == "alta" or any(k in m_urg for k in KEYWORDS_URGENCIA)):
                 priority = "alta"
                 priority_reason = res_var.get("motivo") or "Posible reclamo o urgencia detectada en el mensaje"
             # Follow-up sugerido (2.5): el cliente pateó la decisión
@@ -2824,13 +2870,14 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str, modo: str =
               f"followup={'sí' if followup else 'no'} | draft={'gestion' if draft_gestion_copilot is not None else ('carrito' if carrito_cambio else 'no')}")
         return agente, "", json_data, ""  # ManyChat no envía nada al contacto
 
-    # ESCALADA A HUMANO → el CPM se entera SIEMPRE (pestaña Prioridad), en cualquier modo.
-    # (Bug testeo: el bot derivaba pero nadie del lado del panel se enteraba.)
-    if agente == "agente_humano" and (json_data or {}).get("escalar"):
+    # ESCALADA A HUMANO (auto/manual): tanda aparte con priority + saludo sugerido.
+    # (En copilot ya fue integrada en la tanda del bloque final, más arriba.)
+    if escalada_humano and modo != "copilot":
         asyncio.create_task(cpm_post_suggestions(
-            tenant_id, contact_id, [],
+            tenant_id, contact_id,
+            ["Hola, soy {nombre} 👋 Ya estoy con tu consulta, ¿en qué te puedo ayudar?"],
             priority="alta", priority_reason="El cliente pidió hablar con una persona — tomar la conversación"))
-        print("[ESCALADA] pedido de humano → priority=alta enviada al CPM")
+        print("[ESCALADA] pedido de humano → priority=alta + sugerencia de saludo al CPM")
 
     # RED ANTI-SILENCIO (bug testeo 9/jul: mensaje del cliente sin respuesta): en auto,
     # el bot SIEMPRE responde algo. Si el turno terminó con texto vacío, fallback.
@@ -2962,8 +3009,11 @@ async def revisar_carritos_abandonados():
             await cpm_post_suggestions(tenant_id, contact_id, [],
                                        followup={"texto": texto,
                                                  "sugerido_para": datetime.utcnow().replace(microsecond=0).isoformat() + "Z"})
-            await upsert_conversacion(tenant_id, contact_id, {"recordatorio_enviado": True})
-            print(f"[RECORDATORIO] enviado a {contact_id} (modo={modo}) | {len(carrito)} items | ${total:,.0f}")
+            # La tarea vieja se limpia (regla "no pegajoso"): el próximo mensaje del
+            # cliente se rutea FRESCO, con el carrito intacto esperando su decisión.
+            await upsert_conversacion(tenant_id, contact_id, {
+                "recordatorio_enviado": True, "tarea_pendiente": "", "agente_activo": "none"})
+            print(f"[RECORDATORIO] enviado a {contact_id} (modo={modo}) | {len(carrito)} items | ${total:,.0f} | tarea limpiada")
         except Exception as e:
             print(f"[RECORDATORIO] fallo con {contact_id}: {e}")
 
