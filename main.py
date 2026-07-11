@@ -1049,12 +1049,15 @@ async def manychat_enviar_botones(token: str, subscriber_id: str, texto: str, ca
 
 
 async def notificar_inbox_cpm(page_id: str, contact_id: str, text: str = "",
-                              image_url: str = "", sender: str = "bot"):
-    """Publica un mensaje en el inbox del CPM vía su webhook (respuestas en background,
-       imágenes y transcripciones que no pasan por el flow de ManyChat)."""
+                              image_url: str = "", sender: str = "bot", tipo: str = ""):
+    """Publica en el inbox del CPM vía su webhook (respuestas en background, imágenes,
+       transcripciones). tipo="transcription" → el CPM ACTUALIZA el transcript del
+       último audio del contacto en vez de crear una burbuja nueva."""
     try:
         base_cpm = CPM_API_URL.replace("/api/agent", "")
         body = {"page_id": page_id, "contact_id": contact_id, "text": text, "sender": sender}
+        if tipo:
+            body["type"] = tipo
         if image_url:
             body["image_url"] = image_url
         async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
@@ -1079,14 +1082,19 @@ async def procesar_audio_background(tenant: dict, contact_id: str, url_media: st
         transcripto = await transcribir_audio(url_media)
         if not transcripto:
             aviso = "No pude escuchar bien el audio 🙉 ¿me lo escribís o lo mandás de nuevo?"
+            # cerrar el "transcribiendo..." del inbox y dejar visible el aviso
+            await notificar_inbox_cpm(page_id, contact_id, text="(no se pudo transcribir el audio)",
+                                      sender="contact", tipo="transcription")
             if modo == "auto":
                 await manychat_enviar_texto(token, contact_id, aviso)
+                await notificar_inbox_cpm(page_id, contact_id, text=aviso, sender="bot")
             elif modo == "copilot":
                 await cpm_post_suggestions(tenant_id, contact_id, [aviso])
             return
-        # Transcripción completa al inbox del CPM (se ve junto al audio del contacto)
-        await notificar_inbox_cpm(page_id, contact_id,
-                                  text=f"🎙️ Transcripción: {transcripto}", sender="contact")
+        # Transcripción → evento dedicado: el CPM la setea EN el mensaje de audio
+        # (que muestra "transcribiendo..." hasta que llega esto)
+        await notificar_inbox_cpm(page_id, contact_id, text=transcripto,
+                                  sender="contact", tipo="transcription")
         if modo == "manual":
             # solo dejar el mensaje en el historial del bot (contexto para cuando vuelva a auto/copilot)
             try:
@@ -1108,7 +1116,15 @@ async def procesar_audio_background(tenant: dict, contact_id: str, url_media: st
             # BUG testeo 9/jul: la respuesta en background no pasa por el flow →
             # hay que publicarla en el inbox del CPM explícitamente
             await notificar_inbox_cpm(page_id, contact_id, text=texto, sender="bot")
-        # copilot: manejar_turno ya posteó sugerencias/draft; no hay nada que enviar
+        # COPILOT: si el audio traía productos, el transcript se re-envía AMPLIADO con
+        # la lista al final (el CPM pisa el transcript del mismo audio)
+        if modo == "copilot" and (json_data or {}).get("items_audio"):
+            det = "\n".join(f"• {c}x {n}" + (" (unidad)" if u == "unidad" else "")
+                             for n, c, u in json_data["items_audio"])
+            await notificar_inbox_cpm(page_id, contact_id,
+                                      text=f"{transcripto}\n\n📦 Pide:\n{det}",
+                                      sender="contact", tipo="transcription")
+            print(f"[AUDIO-BG] transcript ampliado con {len(json_data['items_audio'])} productos")
         print(f"[AUDIO-BG] completado | modo={modo} | agente={agente} | resp={len(texto or '')} chars")
     except Exception as e:
         print(f"[AUDIO-BG] excepción: {e}")
@@ -1756,6 +1772,9 @@ async def transcribir_audio(audio_url: str) -> str:
             return None
         audio_bytes = ar.content
         print(f"[transcribir_audio] descargado {len(audio_bytes)} bytes en {datetime.utcnow().timestamp()-t0:.1f}s")
+        if len(audio_bytes) > 24 * 1024 * 1024:
+            print(f"[transcribir_audio] audio de {len(audio_bytes)//1024//1024}MB supera el límite de Whisper (25MB) — abortando")
+            return None
         async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=5.0)) as client:
             r = await client.post(
                 "https://api.openai.com/v1/audio/transcriptions",
@@ -2805,6 +2824,11 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str, modo: str =
     await upsert_conversacion(tenant_id, contact_id, campos_persist)
     await guardar_log(tenant_id, contact_id, agente, mensaje, texto)
 
+    # Items detectados en un turno de AUDIO: se exponen para que el transcript del
+    # inbox se actualice con la lista de productos al final (pedido del 11/jul)
+    if fue_audio and items_turno_audio:
+        json_data["items_audio"] = items_turno_audio
+
     # Escalada a humano: el CPM debe enterarse SIEMPRE (pestaña Prioridad + sugerencia
     # de saludo; {nombre} lo sustituye el CPM por el nombre del operador logueado).
     escalada_humano = (agente == "agente_humano" and (json_data or {}).get("escalar"))
@@ -3144,6 +3168,51 @@ async def pedido_confirmado(request: Request):
         return JSONResponse({"ok": True, "imagen_enviada": enviado, "imagen_url": imagen_url})
     except Exception as e:
         print(f"[PEDIDO-CONFIRMADO] error: {e}")
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@app.post("/draft-actualizado")
+async def draft_actualizado(request: Request):
+    """El OPERADOR editó manualmente el borrador del pedido en el panel (quitó/cambió
+       ítems): el CPM avisa y el carrito local del bot se REEMPLAZA por ese estado,
+       para que bot y panel nunca diverjan.
+       Body: { tenant_id, manychat_contact_id, items: [{product_id, variant_id,
+               product_name, quantity, unit_price, sale_unit?, is_promo?}] }
+       items: [] = el operador vació el borrador. Auth: Bearer AGENT_API_SECRET."""
+    auth = request.headers.get("authorization", "")
+    if auth != f"Bearer {CPM_API_KEY}":
+        return JSONResponse({"ok": False, "error": "no autorizado"}, status_code=401)
+    body = await request.json()
+    tenant_id = str(body.get("tenant_id", "") or "").strip()
+    contact_id = str(body.get("manychat_contact_id", "") or "").strip()
+    if not tenant_id or not contact_id:
+        return JSONResponse({"ok": False, "error": "faltan tenant_id o manychat_contact_id"}, status_code=400)
+    items = body.get("items")
+    if not isinstance(items, list):
+        return JSONResponse({"ok": False, "error": "items debe ser una lista (puede ser vacía)"}, status_code=400)
+    try:
+        carrito_nuevo = []
+        for it in items:
+            if not it.get("variant_id"):
+                continue
+            carrito_nuevo.append({
+                "product_id": it.get("product_id"),
+                "variant_id": it.get("variant_id"),
+                "product_name": it.get("product_name", ""),
+                "cantidad": int(it.get("quantity", 1) or 1),
+                "precio": float(it.get("unit_price", 0) or 0),
+                "sale_unit": it.get("sale_unit", "bulto") or "bulto",
+                "is_promo": bool(it.get("is_promo", False)),
+            })
+        await upsert_conversacion(tenant_id, contact_id, {
+            "pedido_en_curso": carrito_nuevo,
+            "carrito_actualizado_en": datetime.utcnow().isoformat() + "Z",
+            "recordatorio_enviado": False,
+        })
+        print(f"[DRAFT-OPERADOR] carrito sincronizado desde el panel: {len(carrito_nuevo)} items")
+        return JSONResponse({"ok": True, "items": len(carrito_nuevo)})
+    except Exception as e:
+        print(f"[DRAFT-OPERADOR] error: {e}")
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
 
