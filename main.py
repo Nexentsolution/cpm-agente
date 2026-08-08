@@ -3127,18 +3127,11 @@ async def pedido_confirmado(request: Request):
         total = ped.get("total") if isinstance(ped, dict) else None
         if total is None and items_img:
             total = sum(it["precio"] * it["cantidad"] for it in items_img)
-        cfg = {"settings": {}, "name": "", "slug": ""}
-        # config real del tenant para la plantilla (logo, nombre)
-        try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                r = await client.get(f"{SUPABASE_URL}/rest/v1/tenants", headers=_headers(),
-                                     params={"id": f"eq.{tenant_id}", "select": "name,slug,settings"})
-            tdata = r.json()
-            if isinstance(tdata, list) and tdata:
-                cfg = {"name": tdata[0].get("name", ""), "slug": tdata[0].get("slug", ""),
-                       "settings": tdata[0].get("settings") or {}}
-        except Exception:
-            pass
+        # settings del tenant para la plantilla (logo, nombre). OJO: generar_imagen_pedido
+        # espera SETTINGS, no el tenant completo (antes se pasaba el dict entero y la
+        # imagen salía sin logo ni nombre del negocio).
+        cfg_tenant = await get_cfg_por_tenant(tenant_id)
+        cfg = (cfg_tenant or {}).get("settings") or {}
         imagen_url = await generar_imagen_pedido(tenant_id, cfg, items_img) if items_img else ""
         caption = f"✅ ¡Pedido{f' N° {num}' if num else ''} confirmado!"
         if total is not None:
@@ -3401,3 +3394,260 @@ async def orquestador(request: Request):
         return resp
 
 
+
+
+# ═════════════════════════════════════════════════════════════════════
+# MERCADO LIBRE — canal adicional (preguntas públicas + posventa)
+# Flujo INVERSO al de WhatsApp: MELI → CPM → bot → CPM.
+# El bot solo GENERA la respuesta; el envío y la demora los maneja el CPM.
+# ═════════════════════════════════════════════════════════════════════
+
+async def get_cfg_por_tenant(tenant_id: str) -> dict:
+    """Como resolver_tenant pero por tenant_id (MELI no tiene page_id).
+       Devuelve {tenant_id, name, slug, settings} o None. Cachea igual que tenants."""
+    tenant_id = str(tenant_id).strip()
+    ahora = datetime.utcnow().timestamp()
+    clave = f"tenant:{tenant_id}"
+    cacheado = _tenant_cache.get(clave)
+    if cacheado and (ahora - cacheado["ts"]) < TENANT_TTL:
+        return cacheado["data"]
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(
+                f"{SUPABASE_URL}/rest/v1/tenants",
+                headers=_headers(),
+                params={"id": f"eq.{tenant_id}", "select": "id,name,slug,settings"})
+        tdata = r.json()
+    except Exception as e:
+        print(f"[get_cfg_por_tenant] excepción: {e}")
+        return None
+    if not (isinstance(tdata, list) and tdata):
+        print(f"[get_cfg_por_tenant] tenant {tenant_id} no encontrado")
+        return None
+    t = tdata[0]
+    data = {"tenant_id": tenant_id, "name": t.get("name", ""),
+            "slug": t.get("slug", ""), "settings": t.get("settings") or {}}
+    _tenant_cache[clave] = {"ts": ahora, "data": data}
+    return data
+
+
+# Patrones que MELI penaliza en respuestas públicas (datos de contacto / salida
+# de la plataforma). Si el modelo los deja pasar, no se responde: lo toma un humano.
+PATRONES_MELI_PROHIBIDOS = [
+    r"\b\d{2,4}[\s\-]?\d{4}[\s\-]?\d{4}\b",   # teléfonos
+    r"[\w\.\-]+@[\w\.\-]+\.\w+",              # mails
+    r"\bwa\.me\b|\bwhatsapp\b|\bhttps?://",   # links y WhatsApp
+]
+
+
+def _meli_respuesta_bloqueada(texto: str) -> str:
+    """Devuelve el patrón que bloqueó la respuesta, o '' si está limpia."""
+    for pat in PATRONES_MELI_PROHIBIDOS:
+        if re.search(pat, texto or "", re.I):
+            return pat
+    return ""
+
+
+def prompt_meli_pregunta(cfg: dict, publicacion: dict, catalogo_txt: str = "") -> str:
+    """Pregunta PÚBLICA: la respuesta queda publicada bajo el aviso y la leen
+       otros compradores. Una buena respuesta vende también a quien no preguntó."""
+    titulo = publicacion.get("titulo", "")
+    precio = publicacion.get("precio")
+    stock = publicacion.get("stock")
+    atributos = publicacion.get("atributos_txt", "")
+    envio = publicacion.get("envio", "")
+
+    ficha = f"PUBLICACIÓN SOBRE LA QUE PREGUNTAN:\nTítulo: {titulo}"
+    if precio:
+        ficha += f"\nPrecio publicado: ${precio:,.0f}".replace(",", ".")
+    if stock is not None:
+        ficha += f"\nStock disponible: {stock} unidades (NO reveles el número exacto)"
+    if envio:
+        ficha += f"\nEnvío: {envio}"
+    if atributos:
+        ficha += f"\nFicha técnica:\n{atributos}"
+
+    extra_catalogo = ""
+    if catalogo_txt:
+        extra_catalogo = (f"\n\nOTROS PRODUCTOS DEL CATÁLOGO (por si preguntan por variantes "
+                          f"o alternativas; NO los ofrezcas si no vienen al caso):\n{catalogo_txt}")
+
+    return f"""{_ctx_tenant(cfg)}
+
+Estás respondiendo una PREGUNTA PÚBLICA en Mercado Libre, no un chat privado.
+Tu respuesta queda publicada debajo del aviso y la va a leer cualquier persona
+que entre a la publicación. Escribí pensando también en esos otros compradores.
+
+{ficha}{extra_catalogo}
+
+CÓMO RESPONDER:
+- Respondé SOLO lo que preguntan, con precisión, en 1 a 3 líneas.
+- Si el dato está en la ficha, dalo concreto (medida, contenido, material).
+- Si preguntan por stock y hay, confirmá que hay disponibilidad sin dar el número exacto.
+- Si preguntan por envío, remitite a lo que calcula Mercado Libre según el código postal.
+- Si preguntan algo que no sabés con certeza, decilo con naturalidad y ofrecé
+  averiguarlo. NUNCA inventes medidas, compatibilidades ni especificaciones.
+- Cerrá invitando a la compra solo si viene al caso, sin presionar.
+
+PROHIBIDO POR REGLAS DE MERCADO LIBRE (la publicación se penaliza):
+- Dar teléfonos, WhatsApp, mails, direcciones o links externos.
+- Invitar a cerrar la operación fuera de Mercado Libre.
+- Mencionar otros vendedores o comparar con la competencia.
+- Prometer plazos de entrega propios: los define Mercado Libre.
+- Si te piden un contacto por fuera, explicá que por política de Mercado Libre
+  todo se maneja acá, SIN escribir la palabra WhatsApp ni ningún dato de contacto.
+
+TONO: cordial y directo, español rioplatense, sin signos de exclamación de más,
+sin emojis, sin markdown, sin bullets. Nada de "¡Hola! ¡Gracias por tu consulta!"
+— andá al grano con amabilidad.
+
+Devolvé SOLO el texto de la respuesta. Sin JSON, sin comillas, sin prefijos."""
+
+
+def _meli_historial_a_mensajes(historial: list, tope: int) -> list:
+    """Convierte el historial del CPM al formato de mensajes del modelo."""
+    mensajes = []
+    for h in (historial or [])[-tope:]:
+        rol = "user" if h.get("sender") == "contact" else "assistant"
+        texto = str(h.get("text", "")).strip()
+        if texto:
+            mensajes.append({"role": rol, "content": texto[:500]})
+    return mensajes
+
+
+@app.post("/meli-pregunta")
+async def meli_pregunta(request: Request):
+    """CPM manda una pregunta pública de MELI; el bot devuelve la respuesta sugerida.
+       NO la envía: el CPM la encola y la manda con su demora configurada.
+       Body: {tenant_id, question_id, item_id, pregunta, publicacion:{...}, historial?}
+       Respuesta: {ok, respuesta} | {ok:false, error}. Auth: Bearer CPM_API_KEY."""
+    auth = request.headers.get("authorization", "")
+    if auth != f"Bearer {CPM_API_KEY}":
+        return JSONResponse({"ok": False, "error": "no autorizado"}, status_code=401)
+    body = await request.json()
+    tenant_id = str(body.get("tenant_id", "") or "").strip()
+    pregunta = str(body.get("pregunta", "") or "").strip()
+    publicacion = body.get("publicacion") or {}
+    if not tenant_id or not pregunta:
+        return JSONResponse({"ok": False, "error": "faltan tenant_id o pregunta"}, status_code=400)
+    try:
+        cfg_tenant = await get_cfg_por_tenant(tenant_id)
+        if not cfg_tenant:
+            return JSONResponse({"ok": False, "error": "tenant no encontrado"}, status_code=404)
+        cfg = cfg_tenant.get("settings") or {}
+
+        catalogo_txt = ""
+        try:
+            lista = await get_lista_liviana(tenant_id)
+            if lista:
+                catalogo_txt = formato_lista_liviana(lista[:40])
+        except Exception as e:
+            print(f"[meli-pregunta] sin catálogo: {e}")
+
+        mensajes = _meli_historial_a_mensajes(body.get("historial"), 6)
+        mensajes.append({"role": "user", "content": pregunta})
+
+        respuesta = (await llamar_claude(prompt_meli_pregunta(cfg, publicacion, catalogo_txt),
+                                         mensajes, max_tokens=350) or "").strip()
+        if not respuesta:
+            print("[meli-pregunta] el modelo no devolvió respuesta")
+            return JSONResponse({"ok": False, "error": "el modelo no devolvió respuesta"}, status_code=502)
+
+        pat = _meli_respuesta_bloqueada(respuesta)
+        if pat:
+            print(f"[meli-pregunta] BLOQUEADA por patrón {pat} | texto='{respuesta[:120]}'")
+            return JSONResponse({
+                "ok": False,
+                "error": "respuesta_con_datos_de_contacto",
+                "detalle": "La respuesta generada incluía datos de contacto o links, "
+                           "que Mercado Libre penaliza. Requiere respuesta manual.",
+            })
+
+        try:
+            await guardar_log(tenant_id, f"meli:{body.get('item_id', '')}",
+                              "meli_pregunta", pregunta, respuesta)
+        except Exception:
+            pass
+        print(f"[MELI-PREGUNTA] item={body.get('item_id','')} | resp={len(respuesta)} chars")
+        return JSONResponse({"ok": True, "respuesta": respuesta})
+    except Exception as e:
+        print(f"[meli-pregunta] error: {e}")
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@app.post("/meli-mensaje")
+async def meli_mensaje(request: Request):
+    """Mensajería POSVENTA de MELI (privada comprador-vendedor): tono más cercano
+       y se puede hablar del pedido concreto.
+       Body: {tenant_id, pack_id, pedido?:{numero,producto,cantidad,estado_envio},
+              mensaje, historial?}. Respuesta: {ok, respuesta}."""
+    auth = request.headers.get("authorization", "")
+    if auth != f"Bearer {CPM_API_KEY}":
+        return JSONResponse({"ok": False, "error": "no autorizado"}, status_code=401)
+    body = await request.json()
+    tenant_id = str(body.get("tenant_id", "") or "").strip()
+    mensaje = str(body.get("mensaje", "") or "").strip()
+    pedido = body.get("pedido") or {}
+    if not tenant_id or not mensaje:
+        return JSONResponse({"ok": False, "error": "faltan tenant_id o mensaje"}, status_code=400)
+    try:
+        cfg_tenant = await get_cfg_por_tenant(tenant_id)
+        if not cfg_tenant:
+            return JSONResponse({"ok": False, "error": "tenant no encontrado"}, status_code=404)
+        cfg = cfg_tenant.get("settings") or {}
+
+        ficha = ""
+        if pedido:
+            ficha = (f"\nDATOS DEL PEDIDO:\n"
+                     f"Número: {pedido.get('numero', '—')}\n"
+                     f"Producto: {pedido.get('producto', '—')}\n"
+                     f"Cantidad: {pedido.get('cantidad', '—')}\n"
+                     f"Estado del envío: {pedido.get('estado_envio', '—')}\n")
+
+        system = f"""{_ctx_tenant(cfg)}
+
+Estás respondiendo un mensaje POSVENTA de Mercado Libre. El comprador ya compró,
+así que la conversación es privada entre ustedes dos.
+{ficha}
+CÓMO RESPONDER:
+- Sé concreto sobre el estado del pedido si te preguntan por eso.
+- Si preguntan cuándo llega, remitite a lo que informa el seguimiento de Mercado
+  Libre; no inventes fechas propias.
+- Si hay un problema (producto fallado, faltante, demora), reconocelo sin excusas
+  y decile que lo vas a resolver. No prometas reintegros ni cambios: eso lo
+  decide una persona.
+- Si el tema excede lo que podés responder con certeza, decile que lo verificás
+  y le confirmás a la brevedad.
+
+PROHIBIDO: dar teléfonos, mails o links externos, o invitar a operar fuera de
+Mercado Libre.
+
+TONO: cordial, directo, rioplatense, 1 a 3 líneas. Sin emojis ni markdown.
+
+Devolvé SOLO el texto de la respuesta."""
+
+        mensajes = _meli_historial_a_mensajes(body.get("historial"), 8)
+        mensajes.append({"role": "user", "content": mensaje})
+        respuesta = (await llamar_claude(system, mensajes, max_tokens=350) or "").strip()
+        if not respuesta:
+            return JSONResponse({"ok": False, "error": "el modelo no devolvió respuesta"}, status_code=502)
+
+        pat = _meli_respuesta_bloqueada(respuesta)
+        if pat:
+            print(f"[meli-mensaje] BLOQUEADA por patrón {pat} | texto='{respuesta[:120]}'")
+            return JSONResponse({
+                "ok": False,
+                "error": "respuesta_con_datos_de_contacto",
+                "detalle": "La respuesta incluía datos de contacto o links. Requiere respuesta manual.",
+            })
+
+        try:
+            await guardar_log(tenant_id, f"meli:{body.get('pack_id', '')}",
+                              "meli_mensaje", mensaje, respuesta)
+        except Exception:
+            pass
+        print(f"[MELI-MENSAJE] pack={body.get('pack_id','')} | resp={len(respuesta)} chars")
+        return JSONResponse({"ok": True, "respuesta": respuesta})
+    except Exception as e:
+        print(f"[meli-mensaje] error: {e}")
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
