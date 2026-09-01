@@ -1048,6 +1048,30 @@ async def manychat_enviar_botones(token: str, subscriber_id: str, texto: str, ca
         return False
 
 
+async def notificar_plataforma(tenant_id: str, event: str, contact_id: str = "",
+                               contact_name: str = "", detalle: str = ""):
+    """POST a /api/agent/notify — avisa al CPM de escaladas, carritos sin
+       respuesta o contactos nuevos, para que dispare sus propias notificaciones
+       (push, mail, etc.). Fire-and-forget: nunca frena la respuesta al cliente.
+       NOTA: el bot no conoce el conversation_id interno del CPM (solo maneja
+       tenant_id + contact_id) — se manda contact_id en su lugar; a confirmar
+       con el CPM si les alcanza para ubicar la conversación."""
+    try:
+        body = {"tenant_id": tenant_id, "event": event}
+        if contact_id:
+            body["contact_id"] = contact_id
+        if contact_name:
+            body["contact_name"] = contact_name
+        if detalle:
+            body["detalle"] = detalle
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+            r = await client.post(f"{CPM_API_URL}/notify", headers=_headers_cpm(), json=body)
+        if r.status_code not in (200, 201):
+            print(f"[notificar_plataforma] status={r.status_code} resp={r.text[:150]}")
+    except Exception as e:
+        print(f"[notificar_plataforma] excepción (no crítico): {e}")
+
+
 async def notificar_inbox_cpm(page_id: str, contact_id: str, text: str = "",
                               image_url: str = "", sender: str = "bot", tipo: str = ""):
     """Publica en el inbox del CPM vía su webhook (respuestas en background, imágenes,
@@ -1942,6 +1966,12 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str, modo: str =
 
     conv = await get_conversacion(tenant_id, contact_id)
     historial = conv["historial"]
+    # Contacto nuevo: sin historial previo = primera vez que escribe (o su fila
+    # nunca se creó). Se notifica UNA sola vez, antes de que este turno lo llene.
+    if not historial:
+        asyncio.create_task(notificar_plataforma(tenant_id, "contacto_nuevo", contact_id=contact_id,
+                                                 detalle="Primer mensaje de este contacto"))
+        print(f"[CONTACTO-NUEVO] {contact_id} — primera interacción")
     if len(historial) > 40:
         historial = historial[-40:]
     tarea = conv["tarea"]
@@ -2861,6 +2891,8 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str, modo: str =
                 sugerencias.insert(0, "Hola, soy {nombre} 👋 Ya estoy con tu consulta, ¿en qué te puedo ayudar?")
                 priority = "alta"
                 priority_reason = "El cliente pidió hablar con una persona — tomar la conversación"
+                asyncio.create_task(notificar_plataforma(tenant_id, "escalada", contact_id=contact_id,
+                                                         detalle="El cliente pidió hablar con una persona"))
             if not escalada_humano and (res_var.get("urgencia") == "alta" or any(k in m_urg for k in KEYWORDS_URGENCIA)):
                 priority = "alta"
                 priority_reason = res_var.get("motivo") or "Posible reclamo o urgencia detectada en el mensaje"
@@ -2875,6 +2907,8 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str, modo: str =
                     "sugerido_para": (datetime.utcnow() + timedelta(hours=24)).replace(
                         microsecond=0).isoformat() + "Z",
                 }
+                asyncio.create_task(notificar_plataforma(tenant_id, "sin_respuesta", contact_id=contact_id,
+                                                         detalle="El cliente pateó la decisión de compra — pasa a seguimiento"))
         nota = None
         if fue_audio and items_turno_audio:
             det = ", ".join(f"{c}x {n}" + (" (unidad)" if u == "unidad" else "") for n, c, u in items_turno_audio)
@@ -2901,6 +2935,8 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str, modo: str =
             tenant_id, contact_id,
             ["Hola, soy {nombre} 👋 Ya estoy con tu consulta, ¿en qué te puedo ayudar?"],
             priority="alta", priority_reason="El cliente pidió hablar con una persona — tomar la conversación"))
+        asyncio.create_task(notificar_plataforma(tenant_id, "escalada", contact_id=contact_id,
+                                                 detalle="El cliente pidió hablar con una persona"))
         print("[ESCALADA] pedido de humano → priority=alta + sugerencia de saludo al CPM")
 
     # RED ANTI-SILENCIO (bug testeo 9/jul: mensaje del cliente sin respuesta): en auto,
@@ -3037,6 +3073,8 @@ async def revisar_carritos_abandonados():
             # cliente se rutea FRESCO, con el carrito intacto esperando su decisión.
             await upsert_conversacion(tenant_id, contact_id, {
                 "recordatorio_enviado": True, "tarea_pendiente": "", "agente_activo": "none"})
+            asyncio.create_task(notificar_plataforma(tenant_id, "sin_respuesta", contact_id=contact_id,
+                                                     detalle=f"Carrito con {len(carrito)} items sin confirmar hace más de {RECORDATORIO_HORAS}h"))
             print(f"[RECORDATORIO] enviado a {contact_id} (modo={modo}) | {len(carrito)} items | ${total:,.0f} | tarea limpiada")
         except Exception as e:
             print(f"[RECORDATORIO] fallo con {contact_id}: {e}")
@@ -3347,6 +3385,11 @@ async def _orquestador_inner(body: dict):
         try:
             conv = await get_conversacion(tenant["tenant_id"], contact_id)
             historial = conv["historial"]
+            if not historial:
+                asyncio.create_task(notificar_plataforma(tenant["tenant_id"], "contacto_nuevo",
+                                                         contact_id=contact_id,
+                                                         detalle="Primer mensaje de este contacto"))
+                print(f"[CONTACTO-NUEVO] {contact_id} — primera interacción (modo manual)")
             historial.append({"role": "user", "content": mensaje})
             if len(historial) > 40:
                 historial = historial[-40:]
