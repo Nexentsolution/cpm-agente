@@ -406,7 +406,19 @@ def formato_detalle(detalle: list) -> str:
 
 
 
-async def llamar_claude(system_prompt: str, mensajes: list, max_tokens: int = 700) -> str:
+async def llamar_claude(system_prompt, mensajes: list, max_tokens: int = 700) -> str:
+    """system_prompt acepta:
+       - str: se envía como UN bloque cacheado (comportamiento de siempre).
+       - list[dict]: bloques ya armados por el caller, cada uno con su propio
+         cache_control opcional — permite separar la parte ESTÁTICA de un prompt
+         (cacheable, alto hit-rate) de la parte DINÁMICA (carrito/pedidos, que
+         cambia casi todos los turnos y por eso NO debe llevar cache_control,
+         porque si va en el mismo bloque que lo estático invalida el cache
+         completo en cada turno — ver prompt_pedido/prompt_gestion)."""
+    if isinstance(system_prompt, str):
+        system_blocks = [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}]
+    else:
+        system_blocks = system_prompt
     for intento in range(3):
         try:
             async with httpx.AsyncClient(timeout=60) as client:
@@ -420,9 +432,7 @@ async def llamar_claude(system_prompt: str, mensajes: list, max_tokens: int = 70
                     json={
                         "model": MODELO,
                         "max_tokens": max_tokens,
-                        "system": [
-                            {"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}
-                        ],
+                        "system": system_blocks,
                         "messages": mensajes
                     }
                 )
@@ -572,8 +582,14 @@ INFORMACIÓN REAL DE LOS PRODUCTOS:
 Devolvé SOLO el texto al cliente. Sin JSON, sin markdown."""
 
 
-def prompt_pedido(cfg: dict, lista_txt: str, carrito_txt: str) -> str:
-    return f"""{_ctx_tenant(cfg)}
+
+def prompt_pedido_partes(cfg: dict, lista_txt: str, carrito_txt: str) -> tuple:
+    """Como prompt_pedido, pero separado en 3 bloques para el cache de Anthropic:
+       (estático, catálogo, dinámico). El estático + catálogo se cachean
+       (cache_control); el carrito NUNCA (cambia casi todos los turnos — si
+       fuera parte del bloque cacheado, invalidaría el cache en cada mensaje,
+       que es exactamente lo que pasaba con prompt_pedido() como bloque único."""
+    estatico = f"""{_ctx_tenant(cfg)}
 
 Tu rol ahora: TOMAR EL PEDIDO. Atendé con naturalidad e incitá sutilmente a sumar productos (en vez de "¿con eso estaría?", preguntá "¿qué más te llevás?").
 
@@ -595,7 +611,7 @@ CÓMO TRABAJÁS:
 CONFIRMACIÓN (importante):
 - Cuando el cliente quiera cerrar, ANTES de pedir confirmación: si hay productos con 🔥 PROMO en el catálogo que NO están en el carrito, ofrecelos UNA vez de forma breve ("Antes de cerrar: tenemos el Limpiador Marina con 20% off a $67.200, ¿sumás alguno?"). Si el cliente dice que no, pedí la confirmación normal y NO insistas más con promos.
 - Pedí confirmación EXPLÍCITA: "¿Confirmás el pedido?".
-- Marcá accion "confirmar" SOLO si el cliente confirma de forma clara: "confirmo", "sí, cerrá", "dale cerralo", "está bien cerrá". 
+- Marcá accion "confirmar" SOLO si el cliente confirma de forma clara: "confirmo", "sí, cerrá", "dale cerralo", "está bien cerrá".
 - Si el cliente dice algo ambiguo como "si" mientras pregunta otra cosa (ej. "si, cuánto es?"), NO es una confirmación: respondé su pregunta y volvé a pedir confirmación explícita. Ante la duda, NO confirmes.
 
 STOCK (privacidad comercial): NUNCA reveles la cantidad exacta de stock al cliente ("hay 99 bultos" está MAL). Decí solo "hay disponibilidad" o, si queda poco, "quedan pocos". El número exacto del catálogo es dato interno para que valides, no para decirlo.
@@ -604,12 +620,6 @@ FORMATO DE TU RESPUESTA (CRÍTICO — leer con atención):
 - Está TERMINANTEMENTE PROHIBIDO escribir tablas, listas de productos, o el detalle del pedido (con "|", con guiones, o en cualquier formato) en tu texto. JAMÁS. El sistema muestra AUTOMÁTICAMENTE una imagen con el resumen. Si vos escribís la tabla, se duplica y se ve mal.
 - Cuando agregás productos o te piden el resumen/cotización, tu texto debe ser CORTO y sin detalle. Ejemplo: "¡Listo! Acá te dejo el resumen 👇 ¿Confirmás o sumás algo más?". La imagen muestra los productos, no vos.
 - Si el CARRITO ACTUAL está vacío o dice "(vacío)", significa que NO hay pedido en curso (puede que ya se haya confirmado). En ese caso NO inventes ni recuerdes productos de antes: decí que no hay un pedido activo y preguntá qué querés pedir. NUNCA armes una tabla con datos que no están en el carrito actual.
-
-CATÁLOGO (nombres exactos):
-{lista_txt}
-
-CARRITO ACTUAL (con precios, solo para tu referencia — NO lo copies en el texto):
-{carrito_txt}
 
 Respondé SIEMPRE con texto al cliente + este JSON al final (el cliente NO ve el JSON):
 ---JSON---
@@ -627,17 +637,19 @@ REGLAS DEL JSON (CRÍTICO):
 - "unidad": "bulto" (default) o "unidad" si el cliente elige comprar unidades sueltas de un producto fraccionable. La cantidad entonces es en UNIDADES, no bultos.
 - Usá SIEMPRE el nombre exacto del catálogo."""
 
+    catalogo = f"CATÁLOGO (nombres exactos):\n{lista_txt}"
+    dinamico = f"CARRITO ACTUAL (con precios, solo para tu referencia — NO lo copies en el texto):\n{carrito_txt}"
+    return estatico, catalogo, dinamico
 
-def prompt_gestion(cfg: dict, pedidos_txt: str, lista_txt: str) -> str:
-    return f"""{_ctx_tenant(cfg)}
+
+def prompt_gestion_partes(cfg: dict, pedidos_txt: str, lista_txt: str) -> tuple:
+    """Como prompt_gestion, separado en (estático, catálogo, dinámico) para el
+       cache: pedidos_txt es específico de CADA cliente/conversación (rara vez
+       se repite igual entre llamadas) así que va en el bloque dinámico junto
+       con el catálogo actual del turno — solo la parte de reglas es cacheable."""
+    estatico = f"""{_ctx_tenant(cfg)}
 
 Tu rol ahora: GESTIONAR PEDIDOS YA CONFIRMADOS. El cliente pregunta por el estado de un pedido que ya hizo, o quiere modificarlo (agregar, quitar o cambiar cantidad de productos) o cancelarlo. NO estás armando un carrito nuevo desde cero.
-
-PEDIDOS DEL CLIENTE (datos reales del sistema — son la VERDAD, no inventes nada):
-{pedidos_txt}
-
-CATÁLOGO (nombres exactos — usalos TAL CUAL para agregar productos nuevos):
-{lista_txt}
 
 PROMOS (importante): si un producto del catálogo figura con 🔥 PROMO y el cliente lo agrega, mencioná el descuento ("está con 20% off"). La promo aplica SOLO por bulto. Si el cliente aumenta la cantidad de un renglón que ya está [EN PROMO], puede fallar por cupo — si el sistema lo rechaza, avisá cuántas quedan y ofrecé el resto a precio normal.
 
@@ -688,6 +700,10 @@ CONFIRMACIÓN DE CAMBIOS (CRÍTICO):
 - Cuando el cliente pide un cambio (agregar/quitar/cambiar cantidad), primero PEDÍ confirmación: "¿Confirmás que agrego X al pedido N° Y?" y devolvé accion_gestion "nada" (todavía no ejecutás).
 - Cuando en el turno SIGUIENTE el cliente confirma ("sí", "dale", "confirmo", "correcto"), AHÍ SÍ devolvé accion_gestion "modificar" con el order_number y los cambios EXACTOS que venías de proponer (mirá tu mensaje anterior en el historial para saber qué producto, cantidad y unidad era). NO respondas "listo" con accion "nada": si confirmó, el JSON DEBE llevar "modificar" con los cambios, o el pedido NO se actualiza de verdad.
 - Si el cliente confirma pero no queda claro qué cambio era, preguntá de nuevo qué quiere agregar en vez de inventar."""
+
+    dinamico = (f"PEDIDOS DEL CLIENTE (datos reales del sistema — son la VERDAD, no inventes nada):\n{pedidos_txt}\n\n"
+               f"CATÁLOGO (nombres exactos — usalos TAL CUAL para agregar productos nuevos):\n{lista_txt}")
+    return estatico, dinamico
 
 
 
@@ -1053,9 +1069,11 @@ async def notificar_plataforma(tenant_id: str, event: str, contact_id: str = "",
     """POST a /api/agent/notify — avisa al CPM de escaladas, carritos sin
        respuesta o contactos nuevos, para que dispare sus propias notificaciones
        (push, mail, etc.). Fire-and-forget: nunca frena la respuesta al cliente.
-       NOTA: el bot no conoce el conversation_id interno del CPM (solo maneja
-       tenant_id + contact_id) — se manda contact_id en su lugar; a confirmar
-       con el CPM si les alcanza para ubicar la conversación."""
+       Contrato confirmado con el CPM: el bot manda tenant_id + event + contact_id
+       (id del suscriptor de ManyChat) + detalle. El CPM resuelve por su cuenta el
+       contact_name y la conversación abierta más reciente a partir del contact_id
+       — el bot NO necesita mandarlos. contact_name/conversation_id quedan como
+       parámetros opcionales por si en el futuro el bot los tiene a mano."""
     try:
         body = {"tenant_id": tenant_id, "event": event}
         if contact_id:
@@ -2265,11 +2283,14 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str, modo: str =
         # Snapshot del carrito ANTES de procesar (para detectar cambios reales)
         import copy
         carrito_antes = copy.deepcopy(carrito)
-        raw = await llamar_claude(
-            prompt_pedido(cfg, formato_lista_liviana(lista), carrito_txt)
-            + (ctx_vendedor_prompt(cliente_rep) if es_vendedor else ""),
-            historial, max_tokens=600
-        )
+        estatico_p, catalogo_p, dinamico_p = prompt_pedido_partes(cfg, formato_lista_liviana(lista), carrito_txt)
+        extra_vendedor = ctx_vendedor_prompt(cliente_rep) if es_vendedor else ""
+        system_blocks = [
+            {"type": "text", "text": estatico_p, "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": catalogo_p, "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": dinamico_p + extra_vendedor},
+        ]
+        raw = await llamar_claude(system_blocks, historial, max_tokens=600)
         texto_tmp, jd_ped = parsear_respuesta(raw)
         accion = (jd_ped.get("accion") or "nada").lower()
         print(f"[DIAG-PEDIDO] accion='{accion}' | jd_ped={jd_ped} | raw={raw[:200]}")
@@ -2534,11 +2555,13 @@ async def manejar_turno(tenant: dict, contact_id: str, mensaje: str, modo: str =
             carrito_ctx = (f"\n\nEL CLIENTE TIENE ESTOS PRODUCTOS SIN CONFIRMAR (carrito actual): {prods_carrito}. "
                            f"Si pide 'sumá esto / agregá estos al pedido anterior', SON ESTOS productos los que hay que agregar (operacion 'agregar').")
         print(f"[DIAG-GESTION] pedidos_encontrados={len(pedidos)} | carrito_pendiente={len(carrito)}")
-        raw = await llamar_claude(
-            prompt_gestion(cfg, formato_pedidos_gestion(pedidos), formato_lista_liviana(lista_g) + carrito_ctx)
-            + (ctx_vendedor_prompt(cliente_rep) if es_vendedor else ""),
-            historial, max_tokens=500
-        )
+        estatico_g, dinamico_g = prompt_gestion_partes(cfg, formato_pedidos_gestion(pedidos), formato_lista_liviana(lista_g))
+        extra_vendedor_g = ctx_vendedor_prompt(cliente_rep) if es_vendedor else ""
+        system_blocks_g = [
+            {"type": "text", "text": estatico_g, "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": dinamico_g + carrito_ctx + extra_vendedor_g},
+        ]
+        raw = await llamar_claude(system_blocks_g, historial, max_tokens=500)
         texto, jd_g = parsear_respuesta(raw)
         acc_g = (jd_g.get("accion_gestion") or "nada").lower()
         num_g = str(jd_g.get("order_number") or "").strip()
